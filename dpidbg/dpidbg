@@ -133,7 +133,8 @@ cmd_capture() {
     /etc/init.d/netifyd stop >/dev/null 2>&1
     sleep 2
     killall -9 netifyd 2>/dev/null
-    timeout "$secs" netifyd -d -v -R > "$out" 2>&1
+    # -k: the debug instance sometimes ignores the first stop signal for a long time, do not wait for it
+    timeout -k 10 "$secs" netifyd -d -v -R > "$out" 2>&1
     restore
     trap - INT TERM
     echo "Inspection restored. Raw log: $out ($(wc -l < "$out") lines)"
@@ -141,7 +142,7 @@ cmd_capture() {
 
     echo "== catalog loaded by the engine"
     grep -E "^Loaded [0-9]+ apps" "$out" | head -1 | sed 's/^/  /'
-    grep -E "Error loading shared library|Fatal|error" "$out" | sort | uniq -c | head -5 | sed 's/^/  ! /'
+    grep -E "Error loading shared library|Fatal|fatal|cannot|Cannot|failed" "$out" | grep -v "netlink-" | sort | uniq -c | head -5 | sed 's/^/  ! /'
     echo
 
     awk -v ip="$ip" '
