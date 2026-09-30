@@ -22,12 +22,16 @@
 #       option restart      '1'    '0' keeps detection, report and alert but never restarts anything
 #       option max_restarts '3'    most restarts per hour; over that it only reports and alerts
 #       option backlog      '64'   packets waiting in every sample that count as a stall
+#       option core         '0'    '1' saves a core dump (compressed, in the report folder) of a stalled netifyd before
+#                                  restarting it, for root-cause analysis; see analyze-core. A core holds traffic
+#                                  metadata (addresses, host names): keep it private, the newest 2 are kept
 #
 # Files: /root/nfq-stall/<time>/report.txt (diagnostics, newest 10 kept), /root/nfq-stall/events.log (history).
 # Metric: measurement nexwall_nfq_watchdog written to VictoriaMetrics every run; the alert rule in ns-plug reads it.
 # Log: tag nexwall-nfq-watchdog (daemon.crit on an event), visible in the log viewer.
 #
-# Test hooks: NFQ_FILE, DRY_RUN=1 (never restart), SAMPLE_WAIT (seconds), BACKLOG, DUMP_ROOT, NO_UCI=1, NO_METRICS=1, INITD.
+# Test hooks: NFQ_FILE, DRY_RUN=1 (never restart), SAMPLE_WAIT (seconds), BACKLOG, DUMP_ROOT, NO_UCI=1, NO_METRICS=1, INITD,
+# KILL_CMD, CORE_PATTERN_FILE, NO_PRLIMIT=1, CORE_WAIT (seconds), NETIFYD_PID, CORE_MIN_FREE_KB.
 #
 
 NFQ_FILE="${NFQ_FILE:-/proc/net/netfilter/nfnetlink_queue}"
@@ -38,6 +42,11 @@ COOLDOWN=300
 KEEP=10
 VM_WRITE="${VM_WRITE:-http://127.0.0.1:8428/write}"
 INITD="${INITD:-/etc/init.d}"
+KILL_CMD="${KILL_CMD:-kill}"
+CORE_PATTERN_FILE="${CORE_PATTERN_FILE:-/proc/sys/kernel/core_pattern}"
+CORE_WAIT="${CORE_WAIT:-25}"
+CORE_MIN_FREE_KB="${CORE_MIN_FREE_KB:-30000}"
+CORE_KEEP=2
 
 cfg() {
     [ -n "$NO_UCI" ] && return
@@ -47,6 +56,7 @@ cfg() {
 ENABLED=$(cfg enabled);            [ -n "$ENABLED" ]      || ENABLED=1
 RESTART=$(cfg restart);            [ -n "$RESTART" ]      || RESTART=1
 MAX_RESTARTS=$(cfg max_restarts);  [ -n "$MAX_RESTARTS" ] || MAX_RESTARTS=3
+CORE=$(cfg core);                  [ -n "$CORE" ]         || CORE=0
 [ -n "$BACKLOG" ] || BACKLOG=$(cfg backlog)
 [ -n "$BACKLOG" ] || BACKLOG=64
 
@@ -115,6 +125,42 @@ else
     action=restarted
 fi
 
+# Core dump of the stalled engine, for root-cause analysis. netifyd blocks the abort signal in every thread and its
+# main thread leaves SIGQUIT (default action: terminate and dump core) unblocked, so that is the one used. The core
+# limit of the running process is raised first (the engine sets it to 0 at start). The kernel pattern is pointed at
+# /tmp (RAM) for the moment of the dump and restored; the core is then compressed into the report folder.
+capture_core() {
+    pid=${NETIFYD_PID:-$(pidof netifyd | awk '{print $1}')}
+    [ -n "$pid" ] || return 1
+    avail=$(df -k "$1" | awk 'NR == 2 { print $4 }')
+    [ "${avail:-0}" -ge "$CORE_MIN_FREE_KB" ] || { echo "core: skipped, only ${avail:-0} KB free"; return 1; }
+    old_pattern=$(cat "$CORE_PATTERN_FILE" 2>/dev/null)
+    tmpcore=/tmp/nfq-watchdog-core
+    rm -f "$tmpcore".*
+    echo "$tmpcore.%p" > "$CORE_PATTERN_FILE" 2>/dev/null
+    if [ -z "$NO_PRLIMIT" ]; then
+        python3 -c 'import resource, sys; resource.prlimit(int(sys.argv[1]), resource.RLIMIT_CORE, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))' "$pid" 2>/dev/null
+    fi
+    $KILL_CMD -QUIT "$pid"
+    i=0
+    while [ "$i" -lt "$CORE_WAIT" ] && kill -0 "$pid" 2>/dev/null; do sleep 1; i=$((i + 1)); done
+    [ -n "$old_pattern" ] && echo "$old_pattern" > "$CORE_PATTERN_FILE" 2>/dev/null
+    f=$(ls "$tmpcore".* 2>/dev/null | head -n 1)
+    if [ -z "$f" ]; then
+        echo "core: not produced (the engine did not exit on the signal)"
+        return 1
+    fi
+    if gzip -c "$f" > "$1/netifyd.core.gz" 2>/dev/null; then
+        chmod 600 "$1/netifyd.core.gz"
+        echo "core: saved, $(wc -c < "$1/netifyd.core.gz") bytes compressed ($(wc -c < "$f") bytes)"
+    else
+        rm -f "$1/netifyd.core.gz"
+        echo "core: could not be saved"
+    fi
+    rm -f "$f"
+    ls -1t "$DUMP_ROOT"/*/netifyd.core.gz 2>/dev/null | tail -n +$((CORE_KEEP + 1)) | while read -r old; do rm -f "$old"; done
+}
+
 dir="$DUMP_ROOT/$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$dir"
 {
@@ -150,6 +196,10 @@ logger -t nexwall-nfq-watchdog -p daemon.crit "queue(s) $(echo $stalled) stalled
 
 if [ "$action" = "restarted" ]; then
     for s in $services; do
+        if [ "$s" = "netifyd" ] && [ "$CORE" = "1" ]; then
+            echo >> "$dir/report.txt"
+            capture_core "$dir" >> "$dir/report.txt" 2>&1
+        fi
         "$INITD/$s" restart >/dev/null 2>&1
         logger -t nexwall-nfq-watchdog -p daemon.crit "restarted $s"
     done

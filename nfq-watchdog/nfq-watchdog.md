@@ -43,6 +43,7 @@ config watchdog 'watchdog'
 	option restart '1'       # 0 = detect, report and alert, never restart
 	option max_restarts '3'  # most restarts per hour; beyond that it only reports and alerts
 	option backlog '64'      # packets waiting in every sample that count as a stall
+	option core '0'          # 1 = save a core dump of a stalled netifyd before restarting it (root-cause analysis)
 ```
 
 ```sh
@@ -51,6 +52,30 @@ uci set netifyd.watchdog.enabled='0' && uci commit netifyd     # off
 ```
 
 The defaults are shipped with the firmware; no service restart is needed after changing them (read on every run).
+
+## Core dump for root-cause analysis (`core '1'`)
+
+A report says *that* the engine stalled; to see *why* (which thread holds the lock the others wait for) a stack trace of every
+thread is needed. With `core` on, the watchdog, before restarting `netifyd`:
+
+1. raises the core limit of the running engine (it sets it to 0 at start) and sends it `SIGQUIT`: the engine blocks the abort
+   signal in all threads but leaves `SIGQUIT` (default action: terminate and dump core) unblocked in its main thread;
+2. points the kernel core pattern at `/tmp` for the moment of the dump and restores it afterwards;
+3. compresses the core to `/root/nfq-stall/<time>/netifyd.core.gz` (mode 600; typically 2 to 4 MB), skips it when less than
+   30 MB are free, and keeps only the newest 2 cores.
+
+A core holds traffic metadata (addresses, host names): treat it as private and share it only with support. It is **off by
+default**; turn it on on a unit that stalls.
+
+Read it on the build/dev server (needs `gdb` and the builder's volumes, for the build that produced the unit's firmware):
+
+```sh
+analyze-core /path/to/netifyd.core.gz          # stacks of every thread + the threads waiting on a lock
+```
+
+In a stall, look for several capture threads (`ndCaptureNFQueue::Entry`) waiting on the same lock and the one thread that is
+waiting somewhere else while it holds it. Verified on a healthy engine (8 capture threads idle in `select`, 4 detection threads
+waiting, the plugin threads named).
 
 ## Related protections (same package family)
 
@@ -70,7 +95,11 @@ ls /root/nfq-stall/                  # reports
 ```
 
 Test hooks (environment): `NFQ_FILE` (use a fake queue file), `DRY_RUN=1`, `SAMPLE_WAIT`, `BACKLOG`, `DUMP_ROOT`,
-`NO_UCI=1`, `NO_METRICS=1`, `INITD` (directory with stub init scripts).
+`NO_UCI=1`, `NO_METRICS=1`, `INITD` (directory with stub init scripts), `KILL_CMD`, `CORE_PATTERN_FILE`, `NO_PRLIMIT=1`,
+`CORE_WAIT`, `NETIFYD_PID`, `CORE_MIN_FREE_KB`.
+
+The regression tests (19 checks: idle, frozen, backlog, snort, cooldown, limit, dry run, core capture and its failure modes) run
+on a firewall: `sh tests/test-watchdog.sh /usr/sbin/nexwall-nfq-watchdog`.
 
 ```sh
 printf '   54 1 150 2 65531 0 0 1000 1\n' > /tmp/q     # queue 54: 150 packets waiting, counter frozen

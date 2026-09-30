@@ -1,0 +1,67 @@
+#!/bin/sh
+
+#
+# analyze-core - thread stacks from a netifyd core dump saved by nfq-watchdog (runs on the build/dev server, needs gdb)
+#
+# Copyright (C) 2026 Nexwall
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Usage:  analyze-core <netifyd.core.gz> [build volume root]
+#
+# The core is read with the *unstripped* libraries of the build that produced the firmware the unit runs (they carry the
+# symbols and source lines). They are taken from the builder's podman volumes:
+#   <root>/nethsecurity_builder_<ver>_build/_data/target-x86_64_musl/netifyd-<ver>/src/.libs   (engine, plugins)
+#   <root>/nethsecurity_builder_<ver>_staging/_data/target-x86_64_musl/root-x86                (musl libc and libraries)
+# Default root: /home/builder/.local/share/containers/storage/volumes. The build must be the one installed on the unit
+# (same sources); a different build gives wrong frames.
+#
+# Output: one block per thread with its stack, then the threads that wait on a lock, which is what to read in a stall: threads
+# that all wait in the same function on the same lock, and the one thread waiting elsewhere while it holds that lock.
+#
+CORE="$1"
+ROOT="${2:-/home/builder/.local/share/containers/storage/volumes}"
+[ -n "$CORE" ] && [ -f "$CORE" ] || { sed -n '4,22p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+command -v gdb >/dev/null 2>&1 || { echo "analyze-core: gdb is required" >&2; exit 1; }
+
+BUILD=$(ls -d "$ROOT"/nethsecurity_builder_*_build/_data/target-x86_64_musl/netifyd-*/src/.libs 2>/dev/null | sort -V | tail -n 1)
+STAGING=$(ls -d "$ROOT"/nethsecurity_builder_*_staging/_data/target-x86_64_musl/root-x86 2>/dev/null | head -n 1)
+[ -n "$BUILD" ] && [ -d "$BUILD" ] || { echo "analyze-core: no netifyd build found under $ROOT" >&2; exit 1; }
+
+WORK=$(mktemp -d /tmp/analyze-core.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+SYS="$WORK/sysroot"
+mkdir -p "$SYS/usr/lib" "$SYS/usr/sbin" "$SYS/lib"
+if [ -n "$STAGING" ]; then
+    cp -L "$STAGING/lib/ld-musl-x86_64.so.1" "$SYS/lib/" 2>/dev/null
+    ln -sf ld-musl-x86_64.so.1 "$SYS/lib/libc.so"
+    for f in "$STAGING"/usr/lib/lib*.so* "$STAGING"/lib/lib*.so*; do
+        [ -e "$f" ] && cp -L "$f" "$SYS/usr/lib/" 2>/dev/null
+    done
+fi
+# the build's own (unstripped) engine and plugins last, so nothing from the staging area replaces them
+cp -L "$BUILD/libnetifyd.so.4.0.0" "$SYS/usr/lib/libnetifyd.so.4"
+cp "$BUILD"/libnx-*.so "$SYS/usr/lib/"
+cp "$BUILD/netifyd" "$SYS/usr/sbin/netifyd"
+
+case "$CORE" in
+    *.gz) gunzip -c "$CORE" > "$WORK/core" ;;
+    *) cp "$CORE" "$WORK/core" ;;
+esac
+
+gdb -q -batch \
+    -ex "set sysroot $SYS" \
+    -ex "set solib-search-path $SYS/usr/lib:$SYS/lib" \
+    -ex "set pagination off" \
+    -ex "thread apply all bt 25" \
+    "$SYS/usr/sbin/netifyd" "$WORK/core" 2>/dev/null |
+    grep -E "^Thread|^#[0-9]" | sed 's/0x[0-9a-f]* in //' > "$WORK/stacks.txt"
+
+cat "$WORK/stacks.txt"
+echo
+echo "=== threads waiting on a lock (pthread_mutex_lock / futex / cond wait), with the engine function that called it"
+awk '
+    /^Thread/ { if (t != "" && wait != "") print t " -> " wait " | " app; t = $0; wait = ""; app = ""; next }
+    /pthread_mutex_lock|__lock|__wait|__timedwait|futex|cond_wait|cond_timedwait/ { if (wait == "") wait = $0 }
+    /libnetifyd|libnx-|nd[A-Z][A-Za-z]*::/ { if (app == "") app = $0 }
+    END { if (t != "" && wait != "") print t " -> " wait " | " app }
+' "$WORK/stacks.txt" | cut -c1-220

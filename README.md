@@ -10,7 +10,7 @@ script plus a `.md` doc with usage, examples, and known caveats.
 |---|---|
 | [`drppkt`](drppkt/drppkt.md) | Per-flow decision with the deciding rule's name, the reason (firewall rule, zone policy, DPI, IP & Geo Blocking) and the full rule path, including traffic to the firewall itself (`input` chain). |
 | [`fwtrace`](fwtrace/fwtrace.md) | Same engine, focused on routed/NAT'd traffic, one line per flow and decision, with conntrack-based NAT correlation. |
-| [`nfq-watchdog`](nfq-watchdog/nfq-watchdog.md) | Recovers the DPI / IPS engines when a kernel packet queue stops being served: diagnostics report, alert, restart with limits. Runs from cron. |
+| [`nfq-watchdog`](nfq-watchdog/nfq-watchdog.md) | Recovers the DPI / IPS engines when a kernel packet queue stops being served: diagnostics report, optional core dump, alert, restart with limits. Runs from cron. `analyze-core` reads the dumps. |
 | [`dpidbg`](dpidbg/dpidbg.md) | Look inside the DPI engine: status, unclassified traffic, loaded catalog, debug capture with summary. |
 
 `drppkt`, `fwtrace`, `nfq-watchdog` and `dpidbg` are POSIX `/bin/sh` scripts (tested against BusyBox `ash` on-device) sharing `lib/trace.awk` and `lib/common.sh`

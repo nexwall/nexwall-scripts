@@ -51,7 +51,8 @@ the system, not DPI.
 
 ## What to collect before contacting support
 
-1. The newest report folders in `/root/nfq-stall/` (`report.txt`) and `events.log`.
+1. The newest report folders in `/root/nfq-stall/` (`report.txt`), `events.log`, and `netifyd.core.gz` if `watchdog.core` was on
+   (it contains traffic metadata: send it only to support).
 2. `dpidbg status` output and `dpidbg unknown` if the complaint is about traffic classification.
 3. Whether a `netifyd` reload happened shortly before (DPI data/licence update, rule change): `grep netifyd` in the log
    viewer around the event time.
@@ -65,6 +66,7 @@ the system, not DPI.
 | `watchdog.restart` | `1` | `0` = detect, report and alert, never restart |
 | `watchdog.max_restarts` | `3` | restarts per hour before it only reports and alerts |
 | `watchdog.backlog` | `64` | packets waiting in every sample that count as a stall |
+| `watchdog.core` | `0` | `1` saves a core dump of the stalled engine (for support) |
 | `config.mgmt_ports` | `22 443 9090` | TCP ports of the firewall's own management traffic that skip DPI |
 | `10-nfqueue.conf: queue_maxlen` | `256` | queue length; when full, packets pass uninspected (fail-open) |
 
