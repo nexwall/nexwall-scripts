@@ -1,244 +1,70 @@
 #!/bin/sh
-# fwtrace - real-time firewall rule + NAT tracer for Nexwall (nftables/fw4)
-# Efficient shell/awk implementation: a single long-lived awk process does
-# all the trace parsing, dedup, and formatting in-line, instead of a
-# per-packet Python interpreter/subprocess model.
+# fwtrace - real-time firewall rule + NAT tracer for Nexwall (nftables/fw4).
 #
-# Hooks: forward, dstnat, srcnat (NOT input - this tool is about routed/NAT'd
-# traffic, i.e. "why isn't this passing through the firewall", not traffic
-# destined to the firewall's own management IP).
+# Watches ROUTED / NAT'd traffic and prints, once per flow: the decision (ACCEPT / DROP / REJECT),
+# the rule that made it (the rule's name) and the REASON. Decisions by DPI, IP & Geo Blocking and
+# the IPS hand-off are reported too, not only fw4 rules. NAT hops are correlated with conntrack.
 #
-# Only prints once per distinct flow+verdict (a flow is proto/saddr/sport/
-# daddr/dport) - an established connection would otherwise print one line
-# per packet, since nftables assigns a new trace id per packet.
-#
-# When the terminal hop is a NAT chain (or the rule text mentions masquerade/
-# snat/dnat), looks up conntrack for the actual translated address:port.
-#
-# Non-invasive: only inserts non-terminating `meta nftrace set 1` probes.
-# All probe rules + background helpers are removed on exit or via --cleanup.
-#
-# NOTE: the probe-rule marker below is a fixed string, not unique per run -
-# running two fwtrace sessions at once means the second one's --cleanup (or
-# exit) can remove the first one's still-in-use probe rules. Don't run two
-# at once on the same box.
+# Hooks forward, dstnat, srcnat (not input: use drppkt for traffic to the firewall itself).
+# Non-invasive: only a non-terminating `meta nftrace set 1` probe is inserted, removed on exit.
+# Engine: lib/trace.awk (shared with drppkt), shell helpers: lib/common.sh.
 
-TABLE_FAM=inet
-TABLE_NAME=fw4
-HOOK_CHAINS="forward dstnat srcnat"
-MARKER="fwtrace-trace"
+NX_NAME=fwtrace
+NX_LIBDIR=${NX_LIBDIR:-/usr/lib/nexwall-scripts}
+[ -r "$NX_LIBDIR/common.sh" ] || NX_LIBDIR=$(dirname "$0")/../lib
+. "$NX_LIBDIR/common.sh"
+
+# prerouting first: every packet crosses it BEFORE the DPI chain, while dstnat only sees the first
+# packet of a connection - without it a DPI reject on an established flow is never traced
+CHAINS="prerouting forward dstnat srcnat"
 
 usage() {
-	cat <<EOF
+	cat <<USAGE
 Usage: fwtrace [options] <filter...>
        fwtrace --cleanup
 
 Filter tokens (join multiple with "and"):
-  host <ip>              match as destination
-  src host <ip>          match as source
-  dst host <ip>          match as destination
-  net <cidr>             match as destination network
-  src net <cidr>         match as source network
-  dst net <cidr>         match as destination network
-  port <n>               match as destination port
-  src port <n>           match as source port
-  dst port <n>           match as destination port
-  proto <tcp|udp|icmp>   restrict to a protocol
+  host <ip>              match as destination         src host <ip>   as source
+  net <cidr>             match as destination network  src net <cidr>  as source
+  port <n>               match as destination port     src port <n>    as source
+  proto <tcp|udp|icmp>   restrict to a protocol        (IPv4 and IPv6 addresses accepted)
 
 Options:
-  --cleanup   remove any leftover trace rules (e.g. after a killed run) and exit
-  -h, --help  show this help
+  -b, --both    also trace the reverse direction (where a DPI / IP-blocking verdict often appears)
+  -i SECS       stop by itself after SECS seconds
+  -j            one JSON object per line (used by the log viewer)
+  --cleanup     remove leftover probe rules (e.g. after a killed run) and exit
+  -h, --help    this help
 
 Examples:
   fwtrace host 192.168.1.242
-  fwtrace src host 192.168.1.242 and dst host 8.8.8.8
-  fwtrace dst host 192.168.1.242 and dst port 443 and proto tcp
+  fwtrace --both src host 192.168.1.102 and dst port 443 -i 30
   fwtrace dst port 22 and proto tcp
-  fwtrace net 192.168.1.0/24
-  fwtrace --cleanup
-EOF
+USAGE
 	exit 1
 }
 
-cleanup_rules() {
-	removed=0
-	for c in $HOOK_CHAINS; do
-		for h in $(nft -a list chain $TABLE_FAM $TABLE_NAME $c 2>/dev/null | grep "$MARKER" | grep -oE 'handle [0-9]+' | awk '{print $2}'); do
-			nft delete rule $TABLE_FAM $TABLE_NAME $c handle "$h" 2>/dev/null && removed=$((removed + 1))
-		done
-	done
-	if [ "$removed" -gt 0 ]; then
-		echo "[fwtrace] removed $removed leftover trace rule(s)"
-	else
-		echo "[fwtrace] nothing to clean up"
-	fi
-}
-
-[ $# -eq 0 ] && usage
-case "$1" in
-	--cleanup) cleanup_rules; exit 0 ;;
-	-h|--help) usage ;;
-esac
-
-# --- tokenize the filter ---
-DIR=dst
-HOST=""; NET=""; PORT=""; PROTO=""
+NX_BOTH=0; NX_TIMEOUT=0; JSON=0
+_args=""
 while [ $# -gt 0 ]; do
 	case "$1" in
-		and) shift ;;
-		src) DIR=src; shift ;;
-		dst) DIR=dst; shift ;;
-		host) HOST=$2; HOSTDIR=$DIR; DIR=dst; shift 2 ;;
-		net) NET=$2; NETDIR=$DIR; DIR=dst; shift 2 ;;
-		port) PORT=$2; PORTDIR=$DIR; DIR=dst; shift 2 ;;
-		proto) PROTO=$2; shift 2 ;;
+		--cleanup) nx_remove_probes "fwtrace-" $CHAINS; echo "fwtrace: removed $NX_REMOVED leftover probe rule(s)"; exit 0 ;;
 		-h|--help) usage ;;
-		*) echo "Unrecognized filter token: $1" >&2; usage ;;
+		-b|--both) NX_BOTH=1; shift ;;
+		-j) JSON=1; shift ;;
+		-i) [ $# -ge 2 ] || usage; NX_TIMEOUT=$2; shift 2 ;;
+		*) _args="$_args $1"; shift ;;
 	esac
 done
+[ -n "$_args" ] || usage
+case "$NX_TIMEOUT" in ''|*[!0-9]*) nx_die "-i needs a number of seconds" ;; esac
 
-MATCH=""
-[ -n "$PROTO" ] && MATCH="$MATCH meta l4proto $PROTO"
-if [ -n "$HOST" ]; then
-	if [ "$HOSTDIR" = "src" ]; then MATCH="$MATCH ip saddr $HOST"; else MATCH="$MATCH ip daddr $HOST"; fi
+set -- $_args
+nx_parse_filter "$@"
+NX_TAG="fwtrace-$$"
+nx_insert_probes $CHAINS
+if [ "$JSON" != 1 ]; then
+	echo "fwtrace: filter:$(nx_match 0)$( [ "$NX_BOTH" = 1 ] && echo '  (+ reverse direction)')"
+	echo "fwtrace: tracing on:$NX_INSERTED  (Ctrl-C to stop)"
 fi
-if [ -n "$NET" ]; then
-	if [ "$NETDIR" = "src" ]; then MATCH="$MATCH ip saddr $NET"; else MATCH="$MATCH ip daddr $NET"; fi
-fi
-if [ -n "$PORT" ]; then
-	if [ "$PORTDIR" = "src" ]; then MATCH="$MATCH th sport $PORT"; else MATCH="$MATCH th dport $PORT"; fi
-fi
-
-if [ -z "$MATCH" ]; then
-	echo "[fwtrace] refusing to trace with no filter at all (would trace ALL forwarded traffic)." >&2
-	echo "          run 'fwtrace -h' for the filter syntax." >&2
-	exit 1
-fi
-
-INSERTED=""
-for c in $HOOK_CHAINS; do
-	if nft insert rule $TABLE_FAM $TABLE_NAME $c $MATCH meta nftrace set 1 comment "\"$MARKER\"" 2>/dev/null; then
-		INSERTED="$INSERTED $c"
-	else
-		echo "[fwtrace] warning: could not hook chain $c" >&2
-	fi
-done
-
-if [ -z "$INSERTED" ]; then
-	echo "[fwtrace] could not hook any chain, aborting." >&2
-	exit 1
-fi
-
-echo "[fwtrace] filter:$MATCH"
-echo "[fwtrace] tracing on chains:$INSERTED (Ctrl-C to stop)"
-printf "%-12s %-5s %-21s %-21s %-14s %-32s %s\n" TIME PROTO SRC DST CHAIN RULE VERDICT
-
-FIFO="/tmp/.fwtrace.$$.fifo"
-mkfifo "$FIFO" 2>/dev/null
-nft monitor trace > "$FIFO" 2>/dev/null &
-TRACE_PID=$!
-
-CLEANED=0
-do_cleanup() {
-	[ "$CLEANED" = "1" ] && return
-	CLEANED=1
-	kill "$TRACE_PID" 2>/dev/null
-	[ -n "$AWK_PID" ] && kill "$AWK_PID" 2>/dev/null
-	cleanup_rules
-	rm -f "$FIFO"
-}
-trap do_cleanup EXIT INT TERM
-
-awk -v fwtab="$TABLE_NAME" '
-function ts(   cmd, t) {
-	cmd = "date +%H:%M:%S"
-	cmd | getline t
-	close(cmd)
-	return t
-}
-function field1(re,    m) {
-	if (match($0, re, m)) return m[1]
-	return ""
-}
-function conntrack_lookup(saddr, daddr, sport, dport,    cmd, line, n, seg, a, rs, rd, result) {
-	cmd = "conntrack -L 2>/dev/null"
-	result = ""
-	while ((cmd | getline line) > 0) {
-		if (index(line, saddr) == 0 || index(line, daddr) == 0) continue
-		if (sport != "-" && index(line, sport) == 0) continue
-		if (dport != "-" && index(line, dport) == 0) continue
-		n = 0
-		while (match(line, /src=[^ ]+ dst=[^ ]+/)) {
-			seg = substr(line, RSTART, RLENGTH)
-			line = substr(line, RSTART + RLENGTH)
-			n++
-			split(seg, a, " ")
-			srcv[n] = substr(a[1], 5)
-			dstv[n] = substr(a[2], 5)
-		}
-		if (n < 2) continue
-		rs = srcv[n]; rd = dstv[n]
-		if (rd != saddr) { result = "masqueraded: " saddr ":" sport " seen upstream, reply routed via " rd; break }
-		if (rs != daddr) { result = "destination NATed: " daddr ":" dport " -> " rs; break }
-	}
-	close(cmd)
-	return result
-}
-{
-	if (!match($0, /^trace id (\S+) (\S+) (\S+) (\S+) (.*)$/, hd)) next
-	tid = hd[1]; fam = hd[2]; tbl = hd[3]; chn = hd[4]; rest = hd[5]
-	if (tbl != fwtab) next
-
-	if (rest ~ /^packet:/) {
-		fsaddr[tid] = field1("ip saddr ([0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)")
-		fdaddr[tid] = field1("ip daddr ([0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+)")
-		p = field1("ip protocol ([a-z]+)")
-		fproto[tid] = (p != "" ? p : "-")
-		sp = ""; if (match($0, /(tcp|udp) sport ([0-9]+)/, m2)) sp = m2[2]
-		dp = ""; if (match($0, /(tcp|udp) dport ([0-9]+)/, m2)) dp = m2[2]
-		fsport[tid] = (sp != "" ? sp : "-")
-		fdport[tid] = (dp != "" ? dp : "-")
-		next
-	}
-
-	if (!(tid in fsaddr)) next
-
-	verdict = ""
-	target = ""
-	if (match($0, /\(verdict ([a-z]+)( [^\)]+)?\)/, vm)) { verdict = vm[1]; target = vm[2]; gsub(/^ /, "", target) }
-	if (verdict == "") next
-
-	comment = ""
-	if (match($0, /comment "(!fw4: )?([^"]+)"/, cm)) comment = cm[2]
-	if (comment != "") frule[tid] = comment
-	else if ((verdict == "jump" || verdict == "goto") && target != "") frule[tid] = target
-
-	is_reject = ($0 ~ /reject/)
-	if (verdict != "accept" && verdict != "drop" && !is_reject) next   # not terminal yet
-
-	shown = is_reject ? "REJECT" : toupper(verdict)
-	fkey = fproto[tid] SUBSEP fsaddr[tid] SUBSEP fsport[tid] SUBSEP fdaddr[tid] SUBSEP fdport[tid]
-	sig = shown SUBSEP chn
-	if ((fkey in seen) && seen[fkey] == sig) {
-		delete fsaddr[tid]; delete fdaddr[tid]; delete fsport[tid]; delete fdport[tid]; delete fproto[tid]; delete frule[tid]
-		next
-	}
-	seen[fkey] = sig
-
-	rn = (tid in frule) ? frule[tid] : "(default policy)"
-	src = fsaddr[tid] ":" fsport[tid]
-	dst = fdaddr[tid] ":" fdport[tid]
-	printf "%-12s %-5s %-21s %-21s %-14s %-32s %s\n", ts(), fproto[tid], src, dst, chn, rn, shown
-	fflush()
-
-	if (chn ~ /nat/ || $0 ~ /masquerade|snat|dnat/) {
-		nat = conntrack_lookup(fsaddr[tid], fdaddr[tid], fsport[tid], fdport[tid])
-		if (nat != "") { print "             NAT: " nat; fflush() }
-	}
-
-	delete fsaddr[tid]; delete fdaddr[tid]; delete fsport[tid]; delete fdport[tid]; delete fproto[tid]; delete frule[tid]
-}
-' < "$FIFO" &
-AWK_PID=$!
-
-wait "$AWK_PID"
+nx_stream flow "$JSON" $NX_INSERTED

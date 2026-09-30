@@ -8,18 +8,20 @@ script plus a `.md` doc with usage, examples, and known caveats.
 
 | Tool | Purpose |
 |---|---|
-| [`drppkt`](drppkt/drppkt.md) | Live packet trace showing the matched firewall rule (Rule ID) and NAT translation (NAT ID) for traffic to/through the firewall, including the local `input` chain. |
-| [`fwtrace`](fwtrace/fwtrace.md) | Same underlying tracer, focused on routed/NAT'd traffic only (`forward`/`dstnat`/`srcnat`), with per-flow deduplication and conntrack-based NAT correlation. Efficient shell/awk implementation (no per-packet interpreter). |
+| [`drppkt`](drppkt/drppkt.md) | Per-flow decision with the deciding rule's name, the reason (firewall rule, zone policy, DPI, IP & Geo Blocking) and the full rule path, including traffic to the firewall itself (`input` chain). |
+| [`fwtrace`](fwtrace/fwtrace.md) | Same engine, focused on routed/NAT'd traffic, one line per flow and decision, with conntrack-based NAT correlation. |
 
-Both are self-contained POSIX `/bin/sh` scripts (tested against BusyBox
-`ash` on-device) with no dependencies beyond what already ships on Nexwall:
-`nft`, `awk` (GNU awk), `conntrack`, `mkfifo`.
+Both are POSIX `/bin/sh` scripts (tested against BusyBox `ash` on-device) sharing `lib/trace.awk` and `lib/common.sh`
+(installed under `/usr/lib/nexwall-scripts`). Dependencies: `nft`, GNU `awk` (`gawk`), `conntrack`, `mkfifo`.
 
 ## Install
 
 ```sh
-scp <tool>/<tool> root@<firewall-ip>:/usr/sbin/<tool>
-ssh root@<firewall-ip> chmod +x /usr/sbin/<tool>
+# normally shipped by the nexwall-scripts package; by hand:
+scp fwtrace/fwtrace drppkt/drppkt root@<firewall-ip>:/usr/sbin/
+ssh root@<firewall-ip> mkdir -p /usr/lib/nexwall-scripts
+scp lib/trace.awk lib/common.sh root@<firewall-ip>:/usr/lib/nexwall-scripts/
+ssh root@<firewall-ip> chmod +x /usr/sbin/fwtrace /usr/sbin/drppkt
 ```
 
 ## Design notes shared by both tools
@@ -30,16 +32,18 @@ ssh root@<firewall-ip> chmod +x /usr/sbin/<tool>
 - **Self-cleaning**: probe rules, background helper processes (`nft monitor
   trace`, the `awk` formatter), and temporary FIFOs are all removed on
   normal exit, Ctrl‑C, or (for `drppkt`) an auto-timeout.
-- **Single global probe marker per tool**: don't run two instances of the
-  *same* tool at once on one box — the second instance's cleanup can remove
-  the first instance's still-in-use rules. Running `drppkt` and `fwtrace`
-  simultaneously is fine, since each uses its own marker.
+- **Unique marker per run**: several traces can run at the same time; each removes only its own probes.
+- **Validated input**: filters are checked (addresses, ports, `tcp|udp|icmp|icmpv6`) before they reach `nft`, because
+  the Log Viewer's API passes user-entered filters to these tools.
 
 ## Repo layout
 
 ```
 nexwall-scripts/
 ├── README.md
+├── lib/
+│   ├── trace.awk
+│   └── common.sh
 ├── drppkt/
 │   ├── drppkt
 │   └── drppkt.md
