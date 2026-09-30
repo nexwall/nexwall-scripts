@@ -48,7 +48,8 @@ nexwall-scripts/
 │   └── common.sh
 ├── docs/
 │   ├── kba-dpi-engine-stall.md
-│   └── kba-unknown-applications.md
+│   ├── kba-unknown-applications.md
+│   └── watchdog-logs-and-coredumps.md
 ├── drppkt/
 ├── dpidbg/
 ├── fwtrace/
@@ -59,6 +60,7 @@ nexwall-scripts/
 
 - [`docs/kba-dpi-engine-stall.md`](docs/kba-dpi-engine-stall.md): new connections hang while the firewall looks healthy.
 - [`docs/kba-unknown-applications.md`](docs/kba-unknown-applications.md): traffic shows as Unknown or an application is not blocked.
+- [`docs/watchdog-logs-and-coredumps.md`](docs/watchdog-logs-and-coredumps.md): where the queue watchdog logs, reports and core dumps are, and how to enable core dumps.
 
 Future scripts should follow the same pattern: one directory per tool,
 containing the executable and its `.md` doc.

@@ -55,6 +55,8 @@ The defaults are shipped with the firmware; no service restart is needed after c
 
 ## Core dump for root-cause analysis (`core '1'`)
 
+Where the logs, reports and cores are stored and how to enable: [`docs/watchdog-logs-and-coredumps.md`](../docs/watchdog-logs-and-coredumps.md).
+
 A report says *that* the engine stalled; to see *why* (which thread holds the lock the others wait for) a stack trace of every
 thread is needed. With `core` on, the watchdog, before restarting `netifyd`:
 
