@@ -68,9 +68,30 @@ the system, not DPI.
 | `watchdog.backlog` | `64` | packets waiting in every sample that count as a stall |
 | `watchdog.core` | `0` | `1` saves a core dump of the stalled engine (for support) |
 | `config.mgmt_ports` | `22 443 9090` | TCP ports of the firewall's own management traffic that skip DPI |
-| `10-nfqueue.conf: queue_maxlen` | `256` | queue length; when full, packets pass uninspected (fail-open) |
+| `dpi.engine.queue_limit` | `256` | packets that may wait per queue (128, 256, 512 or 1024); written to `10-nfqueue.conf: queue_maxlen` |
+| `dpi.engine.overload_action` | `allow` | what happens to **new connections through the firewall** when a queue is full or the engine is not running: `allow` = they pass uninspected (application rules do not apply to them), `block` = they are dropped until the engine is back |
 
 Tools: [`nfq-watchdog`](../nfq-watchdog/nfq-watchdog.md), [`dpidbg`](../dpidbg/dpidbg.md).
+
+## Overload decision: allow or block
+
+Application Control (DPI) > Settings > **Inspection engine overload**, or `/etc/config/dpi` section `engine`:
+
+```
+config engine 'engine'
+	option overload_action 'allow'   # or 'block'
+	option queue_limit '256'         # 128, 256, 512 or 1024
+```
+
+- **allow (default, recommended):** when the engine cannot keep up (its queue is full) or is not running, new connections pass
+  without inspection. Nothing breaks for users, but application blocking rules do not apply to those connections meanwhile.
+- **block:** nothing passes without inspection, so rules cannot be bypassed, but new connections through the firewall fail
+  until the engine is back (an automatic restart takes one to two minutes). Existing connections keep working.
+- Only **forwarded** traffic follows `block`. The firewall's own traffic (DNS, updates, licensing) and access to the web
+  interface and SSH are never blocked.
+- A *stuck* engine (alive but not serving) is covered by the watchdog in both modes: packets wait until the queue limit is
+  reached, then the action applies; the watchdog restarts the engine.
+- Changing the setting needs **Apply changes**; the firewall rule and the engine's queues are updated without restarting it.
 
 ## Notes
 
