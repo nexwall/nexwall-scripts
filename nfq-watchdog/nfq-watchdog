@@ -1,0 +1,162 @@
+#!/bin/sh
+
+#
+# nfq-watchdog - recovers the firewall when the DPI / IPS packet queues get stuck.
+#
+# Copyright (C) 2026 Nexwall
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# netifyd (queues 50-57) and snort (queues 4-7) read packets from NFQUEUE. If a queue has packets waiting and its
+# verdict counter does not move, or a large backlog stays in the queue (the reader is alive but far too slow),
+# everything hashed to that queue stalls: new connections to or through the firewall hang while others keep
+# working. The nftables "bypass" flag does not help, it only applies when no program is listening.
+#
+# Runs from cron every minute and takes three samples 10 seconds apart. A queue is stalled when packets are waiting
+# in all three samples and (a) its verdict counter did not move, or (b) at least BACKLOG packets are waiting in
+# every sample. On a stall it saves diagnostics, records the event, raises an alert, and (if allowed) restarts the
+# owner of the queue.
+#
+# Settings (/etc/config/netifyd):
+#   config watchdog 'watchdog'
+#       option enabled      '1'    '0' disables the watchdog completely
+#       option restart      '1'    '0' keeps detection, report and alert but never restarts anything
+#       option max_restarts '3'    most restarts per hour; over that it only reports and alerts
+#       option backlog      '64'   packets waiting in every sample that count as a stall
+#
+# Files: /root/nfq-stall/<time>/report.txt (diagnostics, newest 10 kept), /root/nfq-stall/events.log (history).
+# Metric: measurement nexwall_nfq_watchdog written to VictoriaMetrics every run; the alert rule in ns-plug reads it.
+# Log: tag nexwall-nfq-watchdog (daemon.crit on an event), visible in the log viewer.
+#
+# Test hooks: NFQ_FILE, DRY_RUN=1 (never restart), SAMPLE_WAIT (seconds), BACKLOG, DUMP_ROOT, NO_UCI=1, NO_METRICS=1, INITD.
+#
+
+NFQ_FILE="${NFQ_FILE:-/proc/net/netfilter/nfnetlink_queue}"
+DUMP_ROOT="${DUMP_ROOT:-/root/nfq-stall}"
+EVENTS="$DUMP_ROOT/events.log"
+WAIT="${SAMPLE_WAIT:-10}"
+COOLDOWN=300
+KEEP=10
+VM_WRITE="${VM_WRITE:-http://127.0.0.1:8428/write}"
+INITD="${INITD:-/etc/init.d}"
+
+cfg() {
+    [ -n "$NO_UCI" ] && return
+    uci -q get "netifyd.watchdog.$1" 2>/dev/null
+}
+
+ENABLED=$(cfg enabled);            [ -n "$ENABLED" ]      || ENABLED=1
+RESTART=$(cfg restart);            [ -n "$RESTART" ]      || RESTART=1
+MAX_RESTARTS=$(cfg max_restarts);  [ -n "$MAX_RESTARTS" ] || MAX_RESTARTS=3
+[ -n "$BACKLOG" ] || BACKLOG=$(cfg backlog)
+[ -n "$BACKLOG" ] || BACKLOG=64
+
+[ "$ENABLED" = "0" ] && exit 0
+[ -r "$NFQ_FILE" ] || exit 0
+
+now=$(date +%s)
+mkdir -p "$DUMP_ROOT"
+
+# history: number of events, last event, restarts in the last hour, whether the last event hit the limit
+push_metrics() {
+    [ -n "$NO_METRICS" ] && return
+    [ -f "$EVENTS" ] || : > "$EVENTS"
+    awk -F'\t' -v now="$(date +%s)" 'BEGIN { n = 0; last = 0; r = 0; lim = 0 }
+        { n++; last = $1
+          if ($4 == "restarted" && $1 > now - 3600) r++
+          if ($4 == "limit" && $1 > now - 3600) lim = 1 }
+        END { printf "nexwall_nfq_watchdog events=%di,last_event=%di,restarts_1h=%di,limited=%di\n", n, last, r, lim }' "$EVENTS" |
+        curl -s -m 3 -o /dev/null --data-binary @- "$VM_WRITE" 2>/dev/null
+}
+
+snap() {
+    # sample index, queue, packets waiting, verdict sequence
+    awk -v n="$1" '$1 >= 4 && $1 <= 57 { print n, $1, $3, $8 }' "$NFQ_FILE"
+}
+
+# stalled queues: packets waiting in every sample, and either no verdict progress between the first and the last
+# sample, or a sustained backlog of BACKLOG packets or more
+stalled=$( { snap 1; sleep "$WAIT"; snap 2; sleep "$WAIT"; snap 3; } | awk -v backlog="$BACKLOG" '
+    { tot[$2, $1] = $3; seq[$2, $1] = $4; q[$2] = 1 }
+    END {
+        for (k in q) {
+            if (!(tot[k, 1] > 0 && tot[k, 2] > 0 && tot[k, 3] > 0)) continue
+            if (seq[k, 1] == seq[k, 3] ||
+                (tot[k, 1] >= backlog && tot[k, 2] >= backlog && tot[k, 3] >= backlog))
+                print k
+        }
+    }' | sort -n)
+
+if [ -z "$stalled" ]; then
+    push_metrics
+    exit 0
+fi
+
+services=""
+for q in $stalled; do
+    if [ "$q" -ge 50 ]; then s=netifyd; else s=snort; fi
+    case " $services " in *" $s "*) ;; *) services="$services $s" ;; esac
+done
+services=$(echo $services)
+
+# restart budget and cooldown, from the event history
+[ -f "$EVENTS" ] || : > "$EVENTS"
+restarts_1h=$(awk -F'\t' -v now="$now" '$4 == "restarted" && $1 > now - 3600 { n++ } END { print n + 0 }' "$EVENTS")
+last_restart=$(awk -F'\t' '$4 == "restarted" { t = $1 } END { print t + 0 }' "$EVENTS")
+
+if [ -n "$DRY_RUN" ]; then
+    action=dry-run
+elif [ "$RESTART" = "0" ]; then
+    action=restart-disabled
+elif [ "$restarts_1h" -ge "$MAX_RESTARTS" ]; then
+    action=limit
+elif [ $((now - last_restart)) -lt "$COOLDOWN" ]; then
+    action=cooldown
+else
+    action=restarted
+fi
+
+dir="$DUMP_ROOT/$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$dir"
+{
+    date
+    uptime
+    echo "stalled queues: $(echo $stalled)"
+    echo "services: $services"
+    echo "action: $action (restarts in the last hour: $restarts_1h of $MAX_RESTARTS)"
+    echo; echo "== nfnetlink_queue"; cat "$NFQ_FILE"
+    echo; echo "== free"; free
+    echo; echo "== conntrack"; cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null
+    echo; echo "== top"; top -bn1 2>/dev/null | head -20
+    echo; echo "== loopback sockets (Recv-Q/Send-Q of the flows and stats daemons)"
+    netstat -tn 2>/dev/null | grep -E "127.0.0.1:(8080|8081)|Recv-Q"
+    echo; echo "== processes"; ps | grep -E "netifyd|snort|ns-flows|ns-stats|nethsecurity|banip|telegraf|victoria" | grep -v grep
+    for s in $services; do
+        for pid in $(pidof "$s"); do
+            echo; echo "== $s $pid threads (tid state utime stime wchan syscall-and-futex-address)"
+            for t in /proc/$pid/task/*; do
+                echo "$(basename $t) $(awk '{print $3, $14, $15}' $t/stat 2>/dev/null) $(cat $t/wchan 2>/dev/null) | $(cut -d' ' -f1-3 $t/syscall 2>/dev/null)"
+            done
+            echo "-- executable mappings (for offline symbolisation)"
+            grep -E "r-xp" /proc/$pid/maps 2>/dev/null | awk '{print $1, $6}' | head -40
+        done
+    done
+    echo; echo "== nft netifyd"; nft list table inet netifyd 2>&1
+    echo; echo "== dmesg"; dmesg | tail -40
+} > "$dir/report.txt" 2>&1
+
+printf '%s\t%s\t%s\t%s\t%s\n' "$now" "$(echo $stalled | tr ' ' ',')" "$(echo $services | tr ' ' ',')" "$action" "$dir" >> "$EVENTS"
+
+logger -t nexwall-nfq-watchdog -p daemon.crit "queue(s) $(echo $stalled) stalled, owner: $services, action: $action, report: $dir"
+
+if [ "$action" = "restarted" ]; then
+    for s in $services; do
+        "$INITD/$s" restart >/dev/null 2>&1
+        logger -t nexwall-nfq-watchdog -p daemon.crit "restarted $s"
+    done
+fi
+
+push_metrics
+
+# keep the newest reports only
+ls -1d "$DUMP_ROOT"/*/ 2>/dev/null | sort | head -n -"$KEEP" | while read -r old; do rm -rf "$old"; done
+exit 0

@@ -10,8 +10,10 @@ script plus a `.md` doc with usage, examples, and known caveats.
 |---|---|
 | [`drppkt`](drppkt/drppkt.md) | Per-flow decision with the deciding rule's name, the reason (firewall rule, zone policy, DPI, IP & Geo Blocking) and the full rule path, including traffic to the firewall itself (`input` chain). |
 | [`fwtrace`](fwtrace/fwtrace.md) | Same engine, focused on routed/NAT'd traffic, one line per flow and decision, with conntrack-based NAT correlation. |
+| [`nfq-watchdog`](nfq-watchdog/nfq-watchdog.md) | Recovers the DPI / IPS engines when a kernel packet queue stops being served: diagnostics report, alert, restart with limits. Runs from cron. |
+| [`dpidbg`](dpidbg/dpidbg.md) | Look inside the DPI engine: status, unclassified traffic, loaded catalog, debug capture with summary. |
 
-Both are POSIX `/bin/sh` scripts (tested against BusyBox `ash` on-device) sharing `lib/trace.awk` and `lib/common.sh`
+`drppkt`, `fwtrace`, `nfq-watchdog` and `dpidbg` are POSIX `/bin/sh` scripts (tested against BusyBox `ash` on-device) sharing `lib/trace.awk` and `lib/common.sh`
 (installed under `/usr/lib/nexwall-scripts`). Dependencies: `nft`, GNU `awk` (`gawk`), `conntrack`, `mkfifo`.
 
 ## Install
@@ -44,13 +46,17 @@ nexwall-scripts/
 ├── lib/
 │   ├── trace.awk
 │   └── common.sh
+├── docs/
+│   └── kba-dpi-engine-stall.md
 ├── drppkt/
-│   ├── drppkt
-│   └── drppkt.md
-└── fwtrace/
-    ├── fwtrace
-    └── fwtrace.md
+├── dpidbg/
+├── fwtrace/
+└── nfq-watchdog/
 ```
+
+## Knowledge base articles
+
+- [`docs/kba-dpi-engine-stall.md`](docs/kba-dpi-engine-stall.md): new connections hang while the firewall looks healthy.
 
 Future scripts should follow the same pattern: one directory per tool,
 containing the executable and its `.md` doc.

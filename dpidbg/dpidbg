@@ -1,0 +1,180 @@
+#!/bin/sh
+
+#
+# dpidbg - look inside the DPI engine (netifyd): status, unclassified traffic, debug capture, loaded catalog.
+#
+# Copyright (C) 2026 Nexwall
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Commands:
+#   dpidbg status                     engine state from its control socket, packet queues, watchdog
+#   dpidbg unknown [-n N]             what is still unclassified right now (live flow table), grouped by host
+#   dpidbg catalog                    what the engine loaded (applications, domains, networks) and from which files
+#   dpidbg capture [-s SECS] [-i IP] [-o FILE]
+#                                     debug capture: real-time detections straight from the engine, then a summary
+#
+# "capture" stops the service and runs the engine in debug mode for SECS seconds (default 30, max 300), then starts
+# the service again (also on Ctrl-C). Traffic keeps flowing (the queues fail open) but is not inspected meanwhile
+# and the live flow table restarts. Use it on a test or during a maintenance window.
+#
+
+SOCK=/var/run/netifyd/netifyd.sock
+ND_CONF=/etc/netifyd
+
+usage() {
+    sed -n '/^# Commands:/,/^#$/p' "$0" | sed 's/^# \{0,1\}//' | sed '$d'
+    exit "${1:-0}"
+}
+
+need_root() {
+    [ "$(id -u)" = "0" ] || { echo "dpidbg: run as root" >&2; exit 1; }
+}
+
+cmd_status() {
+    echo "== engine (control socket)"
+    if [ -S "$SOCK" ] && command -v socat >/dev/null 2>&1; then
+        echo '{"command":"status"}' | timeout 4 socat - "UNIX-CONNECT:$SOCK" 2>/dev/null | python3 -c '
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())["data"]
+except Exception:
+    print("  no answer from the engine"); sys.exit()
+print("  %s" % d.get("agent_version", "?"))
+print("  uptime %ds, flows %s (active %s), purged %s, memory %s MB, cpu user %.1fs system %.1fs" % (
+    d.get("uptime", 0), d.get("flow_count"), d.get("flows_active"), d.get("flows_purged"),
+    round(d.get("memrss_kb", 0) / 1024.0, 1), d.get("cpu_user", 0), d.get("cpu_system", 0)))
+print("  dns hint cache %s, flow hash cache %s" % (d.get("dhc_status"), d.get("fhc_status")))
+'
+    else
+        echo "  engine not running or socat missing"
+    fi
+    echo
+    echo "== packet queues (queue, waiting, verdicts so far)"
+    awk '{ printf "  queue %-3s waiting %-5s verdicts %s\n", $1, $3, $8 }' /proc/net/netfilter/nfnetlink_queue 2>/dev/null
+    echo
+    echo "== queue watchdog"
+    if [ -f /root/nfq-stall/events.log ]; then
+        echo "  events: $(wc -l < /root/nfq-stall/events.log), last:"
+        tail -n 3 /root/nfq-stall/events.log | awk -F'\t' '{ printf "    %s queues=%s owner=%s action=%s\n", strftime("%F %T", $1), $2, $3, $4 }' 2>/dev/null ||
+            tail -n 3 /root/nfq-stall/events.log
+    else
+        echo "  no stall recorded"
+    fi
+}
+
+cmd_unknown() {
+    n=15
+    while [ $# -gt 0 ]; do
+        case "$1" in -n) n="$2"; shift 2 ;; *) usage 1 ;; esac
+    done
+    echo '{"q":"","sort_by":"download","desc":true,"per_page":1000,"page":1,"application":[],"protocol":[],"source":[],"destination":[],"tag":[]}' |
+        /usr/libexec/rpcd/ns.flows call list | python3 -c '
+import sys, json, collections
+n = int(sys.argv[1])
+try:
+    flows = json.load(sys.stdin)["flows"]
+except Exception:
+    print("no flow data (is the flows service running?)"); sys.exit(1)
+total = len(flows)
+unk = [e["flow"] for e in flows if e["flow"].get("detected_application_name") == "Unknown"]
+tb = sum(e["flow"].get("total_bytes", 0) for e in flows) or 1
+ub = sum(f.get("total_bytes", 0) for f in unk)
+print("flows %d, application unknown %d (%.0f%%), unknown bytes %.0f%%" % (total, len(unk), 100.0 * len(unk) / max(total, 1), 100.0 * ub / tb))
+def host(f):
+    return f.get("host_server_name") or (f.get("ssl") or {}).get("client_sni") or f.get("dns_host_name") or ""
+by = collections.Counter(); byb = collections.Counter(); prot = {}
+for f in unk:
+    h = host(f) or ("ip " + f.get("other_ip", "?"))
+    by[h] += 1; byb[h] += f.get("total_bytes", 0); prot.setdefault(h, collections.Counter())[f.get("detected_protocol_name", "?")] += 1
+print("\n%-44s %5s %10s  %s" % ("host (or remote ip when the flow has no name)", "flows", "bytes", "protocol"))
+for h, c in by.most_common(n):
+    print("%-44s %5d %10d  %s" % (h[:44], c, byb[h], prot[h].most_common(1)[0][0]))
+nohost = sum(1 for f in unk if not host(f))
+print("\n%d of %d unknown flows have no host name at all (no SNI, no DNS name): these can only be matched by network" % (nohost, len(unk)))
+' "$n"
+}
+
+cmd_catalog() {
+    echo "== files"
+    ls -l "$ND_CONF"/netify-apps.conf "$ND_CONF"/netify-*catalog*.json "$ND_CONF"/netify-*categories*.json 2>/dev/null |
+        awk '{ printf "  %s %s %s %s  %s\n", $5, $6, $7, $8, $9 }'
+    echo
+    echo "== rules in netify-apps.conf"
+    cut -d: -f1 "$ND_CONF/netify-apps.conf" 2>/dev/null | grep -E '^(app|dom|net|nsd|ip)$' | sort | uniq -c | awk '{ printf "  %-5s %s\n", $2, $1 }'
+    echo
+    echo "== what the running engine reports at load time (from the log)"
+    if command -v curl >/dev/null 2>&1; then
+        curl -s -m 5 'http://127.0.0.1:9428/select/logsql/query' --data-urlencode 'query=_time:1d app_name:netifyd "Loaded" "apps"' --data-urlencode 'limit=1' 2>/dev/null |
+            python3 -c 'import sys, json
+for l in sys.stdin:
+    if l.strip(): print("  " + json.loads(l).get("_msg", ""))' 2>/dev/null
+    fi
+    echo "  (run: dpidbg capture -s 5 to print the load line again)"
+}
+
+cmd_capture() {
+    need_root
+    secs=30; ip=""; out="/tmp/dpidbg-$(date +%Y%m%d-%H%M%S).log"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -s) secs="$2"; shift 2 ;;
+            -i) ip="$2"; shift 2 ;;
+            -o) out="$2"; shift 2 ;;
+            *) usage 1 ;;
+        esac
+    done
+    case "$secs" in ''|*[!0-9]*) echo "dpidbg: -s needs a number of seconds" >&2; exit 1 ;; esac
+    [ "$secs" -ge 5 ] && [ "$secs" -le 300 ] || { echo "dpidbg: -s must be between 5 and 300" >&2; exit 1; }
+    case "$ip" in ''|*[!0-9a-fA-F:.]*) [ -z "$ip" ] || { echo "dpidbg: -i needs an IP address" >&2; exit 1; } ;; esac
+
+    restore() { /etc/init.d/netifyd start >/dev/null 2>&1; }
+    trap 'restore; exit 130' INT TERM
+    echo "Pausing inspection for ${secs}s (traffic keeps flowing, not inspected)..."
+    /etc/init.d/netifyd stop >/dev/null 2>&1
+    sleep 2
+    killall -9 netifyd 2>/dev/null
+    timeout "$secs" netifyd -d -v -R > "$out" 2>&1
+    restore
+    trap - INT TERM
+    echo "Inspection restored. Raw log: $out ($(wc -l < "$out") lines)"
+    echo
+
+    echo "== catalog loaded by the engine"
+    grep -E "^Loaded [0-9]+ apps" "$out" | head -1 | sed 's/^/  /'
+    grep -E "Error loading shared library|Fatal|error" "$out" | sort | uniq -c | head -5 | sed 's/^/  ! /'
+    echo
+
+    awk -v ip="$ip" '
+        function flush() {
+            if (head != "" && (ip == "" || index(head, ip) > 0)) {
+                n++; label = proto; if (label == "") label = "?"
+                cnt[label]++
+                known = (label ~ /\./)
+                if (known) napp++
+                else { nopp++; if (host != "") unk[host " [" label "]"]++; else unk["(no name) " remote " [" label "]"]++ }
+            }
+            head = ""; proto = ""; host = ""; remote = ""
+        }
+        /^[A-Za-z0-9_.-]+: [a-z0-9-]+ [A-Za-z0-9]+ \[[A-Z][A-Z]\] / { flush(); head = $0; split($0, a, " "); remote = $5; getline; sub(/^ *: /, ""); proto = $1; next }
+        /^ *: H: / { sub(/^ *: H: /, ""); host = $0 }
+        /^ *: D: / { if (host == "") { sub(/^ *: D: /, ""); host = $0 } }
+        END {
+            flush()
+            printf "== detections in the capture%s: %d flow events\n", (ip != "" ? " (only " ip ")" : ""), n
+            printf "  with an application: %d   protocol only (no application): %d\n\n", napp, nopp
+            print "== most frequent detections"
+            for (k in cnt) printf "%6d  %s\n", cnt[k], k | "sort -rn | head -15"
+            close("sort -rn | head -15")
+            print "\n== protocol-only flows by host (candidates to add to the catalog)"
+            for (k in unk) printf "%6d  %s\n", unk[k], k | "sort -rn | head -20"
+        }' "$out"
+}
+
+case "$1" in
+    status) shift; cmd_status "$@" ;;
+    unknown) shift; cmd_unknown "$@" ;;
+    catalog) shift; cmd_catalog "$@" ;;
+    capture) shift; cmd_capture "$@" ;;
+    -h|--help|help|"") usage 0 ;;
+    *) usage 1 ;;
+esac
