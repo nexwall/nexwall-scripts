@@ -1,0 +1,13 @@
+#!/bin/sh
+# performance settings shared by the DPI and IPS pages; the fast path is off until the administrator turns it on
+if ! uci -q get nexwall_perf.main >/dev/null; then
+	touch /etc/config/nexwall_perf
+	uci -q batch <<EOI
+set nexwall_perf.main=main
+set nexwall_perf.main.fastpath='0'
+set nexwall_perf.main.min_bytes='auto'
+commit nexwall_perf
+EOI
+fi
+/etc/init.d/nexwall-fastpath enable
+exit 0

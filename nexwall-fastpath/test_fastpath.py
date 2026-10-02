@@ -1,0 +1,112 @@
+import importlib.machinery
+import importlib.util
+import os
+
+import pytest
+
+SCRIPT = os.path.join(os.path.dirname(__file__), 'nexwall-fastpath')
+
+
+@pytest.fixture()
+def mod():
+    loader = importlib.machinery.SourceFileLoader('nexwall_fastpath', SCRIPT)
+    spec = importlib.util.spec_from_loader('nexwall_fastpath', loader)
+    m = importlib.util.module_from_spec(spec)
+    loader.exec_module(m)
+    return m
+
+
+def make_sys_net(tmp_path, layout):
+    """layout: device -> list of (kind, name) with kind brif or lower"""
+    for device, below in layout.items():
+        (tmp_path / device).mkdir(exist_ok=True)
+        for kind, name in below:
+            if kind == 'brif':
+                (tmp_path / device / 'brif').mkdir(exist_ok=True)
+                (tmp_path / device / 'brif' / name).mkdir()
+            else:
+                (tmp_path / device / f'lower_{name}').mkdir()
+            (tmp_path / name).mkdir(exist_ok=True)
+    return str(tmp_path)
+
+
+def test_bridge_ports_and_vlans_are_resolved(mod, tmp_path):
+    sys_net = make_sys_net(tmp_path, {
+        'br-lan': [('brif', 'eth0'), ('brif', 'eth2.10')],
+        'eth2.10': [('lower', 'eth2')],
+        'eth1': [],
+    })
+    assert mod.lower_devices('br-lan', sys_net) == ['eth0', 'eth2']
+    assert mod.lower_devices('eth1', sys_net) == ['eth1']
+    assert mod.lower_devices('missing', sys_net) == []
+
+
+def test_flow_devices_skip_tunnels_down_and_unset(mod, tmp_path):
+    sys_net = make_sys_net(tmp_path, {'br-lan': [('brif', 'eth0')], 'eth1': [], 'tunrw1': [], 'wg0': []})
+    interfaces = [
+        {'interface': 'lan', 'up': True, 'proto': 'static', 'device': 'br-lan', 'l3_device': 'br-lan'},
+        {'interface': 'wan', 'up': True, 'proto': 'dhcp', 'device': 'eth1', 'l3_device': 'eth1'},
+        {'interface': 'vpn', 'up': True, 'proto': 'none', 'device': 'tunrw1'},
+        {'interface': 'wg', 'up': True, 'proto': 'wireguard', 'device': 'wg0'},
+        {'interface': 'wan2', 'up': False, 'proto': 'dhcp', 'device': 'eth3'},
+        {'interface': 'loopback', 'up': True, 'proto': 'static', 'device': 'lo'},
+    ]
+    assert mod.flow_devices(interfaces, sys_net) == ['eth0', 'eth1']
+
+
+def test_pppoe_uses_the_device_under_the_session(mod, tmp_path):
+    sys_net = make_sys_net(tmp_path, {'eth1': [], 'pppoe-wan': []})
+    interfaces = [{'interface': 'wan', 'up': True, 'proto': 'pppoe', 'device': 'eth1', 'l3_device': 'pppoe-wan'}]
+    assert mod.flow_devices(interfaces, sys_net) == ['eth1']
+
+
+@pytest.mark.parametrize('ips,setting,depth,expected', [
+    (False, 'auto', '1048576', 262144),
+    (True, 'auto', '1048576', 1048576),
+    (True, 'auto', '4194304', 4194304),
+    (True, 'auto', '1000', 262144),      # never below the floor
+    (False, '2000000', '1048576', 2000000),
+    (True, '100', '1048576', 262144),
+    (True, 'junk', '1048576', 1048576),
+    (True, None, '1048576', 1048576),
+])
+def test_threshold(mod, monkeypatch, ips, setting, depth, expected):
+    monkeypatch.setattr(mod, 'uci_get', lambda c, s, o, d=None: depth)
+    assert mod.min_bytes(ips, setting) == expected
+
+
+def test_ruleset_with_the_traffic_engine(mod):
+    text = mod.render(['eth0', 'eth1'], 1048576, True)
+    assert 'devices = { eth0, eth1 };' in text
+    assert '        counter\n' in text   # connection tracker counters stay current while offloaded
+    assert 'filter + 20' in text            # behind both engines' hooks
+    assert 'ct state != established return' in text
+    assert 'ct label "netify-analyzed" jump candidate' in text
+    for label in ('netify-blocked', 'bulk', 'best_effort', 'video', 'voice'):
+        assert f'ct label "{label}" return' in text
+    assert 'ct packets > 32 ct bytes > 1048576 flow add @ft' in text
+    # the label rules come before the offload rule
+    assert text.index('ct label "voice" return') < text.index('flow add @ft')
+
+
+def test_ruleset_without_the_traffic_engine_has_no_labels(mod):
+    text = mod.render(['eth1'], 262144, False)
+    assert 'ct label' not in text
+    assert 'jump candidate' in text
+    assert 'ct bytes > 262144 flow add @ft' in text
+
+
+def test_offloaded_flows_are_counted(mod, tmp_path):
+    f = tmp_path / 'ct'
+    f.write_text('ipv4 2 tcp 6 100 ESTABLISHED src=1 [OFFLOAD] mark=0\nipv4 2 tcp 6 100 ESTABLISHED src=2 mark=0\n')
+    assert mod.offloaded_flows(str(f)) == 1
+    assert mod.offloaded_flows(str(tmp_path / 'none')) == 0
+
+
+def test_flow_listing(mod, tmp_path):
+    f = tmp_path / 'ct'
+    f.write_text('ipv4 2 tcp 6 100 ESTABLISHED src=10.0.0.2 dst=1.1.1.1 sport=40000 dport=443 packets=5 bytes=1000 '
+                 'src=1.1.1.1 dst=192.168.0.2 sport=443 dport=40000 packets=9 bytes=9000 [OFFLOAD] mark=0\n'
+                 'ipv4 2 udp 17 30 src=10.0.0.3 dst=8.8.8.8 sport=1 dport=53 packets=1 bytes=60 src=8.8.8.8 dst=1.1.1.2 sport=53 dport=1 packets=1 bytes=90 mark=0\n')
+    assert mod.flows(str(f)) == [('tcp', '10.0.0.2', '1.1.1.1', '40000', '443', 10000)]
+    assert mod.flows(str(tmp_path / 'none')) == []

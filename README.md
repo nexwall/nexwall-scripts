@@ -49,10 +49,13 @@ nexwall-scripts/
 ├── docs/
 │   ├── kba-dpi-engine-stall.md
 │   ├── kba-unknown-applications.md
+│   ├── kba-fast-path-offload.md
+│   ├── kba-dpi-ips-tuning.md
 │   └── watchdog-logs-and-coredumps.md
 ├── drppkt/
 ├── dpidbg/
 ├── fwtrace/
+├── nexwall-fastpath/
 └── nfq-watchdog/
 ```
 
@@ -60,6 +63,8 @@ nexwall-scripts/
 
 - [`docs/kba-dpi-engine-stall.md`](docs/kba-dpi-engine-stall.md): new connections hang while the firewall looks healthy.
 - [`docs/kba-unknown-applications.md`](docs/kba-unknown-applications.md): traffic shows as Unknown or an application is not blocked.
+- [`docs/kba-fast-path-offload.md`](docs/kba-fast-path-offload.md): the fast path (flow offload): commands, status, where offloaded traffic shows, troubleshooting.
+- [`docs/kba-dpi-ips-tuning.md`](docs/kba-dpi-ips-tuning.md): the tuning controls in the DPI and IPS Settings tabs, what they do, how to check the effect.
 - [`docs/watchdog-logs-and-coredumps.md`](docs/watchdog-logs-and-coredumps.md): where the queue watchdog logs, reports and core dumps are, and how to enable core dumps.
 
 Future scripts should follow the same pattern: one directory per tool,

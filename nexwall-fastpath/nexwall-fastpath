@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+
+#
+# Copyright (C) 2026 Nexwall
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Fast path for connections the inspection engines are finished with.
+#
+# The traffic engine (DPI) looks at the first 32 packets of a connection and the intrusion prevention (IPS) at the first
+# megabyte; after that the rest of a long transfer only needs to be forwarded. This script hands such connections to the
+# kernel's software flow table, which forwards their packets without walking the firewall, routing and NAT hooks again
+# (typically 1.5 to 2.5 times the forwarding throughput on small CPUs).
+#
+# It is NOT the stock firewall "flow offloading" switch: that one offloads every connection right after the handshake and
+# would hide the start of every connection from both engines. Here a connection qualifies only when
+#   - it is established and has moved more than the inspection depth (IPS depth when the IPS runs), and
+#   - when the DPI engine runs, the engine has marked it "netify-analyzed" and it carries no traffic-class label
+#     (bulk, best_effort, video, voice), because the DSCP marking for those classes is done by a hook offloaded packets skip.
+# Everything is in its own nftables table (inet nexwall_fastpath); removing the table puts all connections back on the
+# normal path. Any error leaves traffic on the normal path.
+#
+# Usage: nexwall-fastpath apply | status | stop | list
+#   list: the connections that are on the fast path right now (also: grep OFFLOAD /proc/net/nf_conntrack, conntrack -L | grep OFFLOAD)
+# Every apply, stop and failure is written to the system log with the tag nexwall-fastpath (logread -e nexwall-fastpath).
+# Settings (/etc/config/nexwall_perf, section main): fastpath 0|1, min_bytes auto|<bytes>
+
+import json
+import os
+import subprocess
+import sys
+
+TABLE = 'nexwall_fastpath'
+STATE_FILE = '/var/run/nexwall-fastpath.json'
+CONNTRACK_FILE = '/proc/net/nf_conntrack'
+SYS_NET = '/sys/class/net'
+DPI_PACKETS = 32                  # the DPI engine does not look past this
+MIN_BYTES = 262144                # never offload before this many bytes, whatever the setting
+DEFAULT_IPS_DEPTH = 1048576       # snort.nfq.max_inspect_bytes default
+QOS_LABELS = ('bulk', 'best_effort', 'video', 'voice')
+TUNNEL_PREFIXES = ('lo', 'tun', 'tap', 'wg', 'ipsec', 'ifb', 'gre', 'vti', 'ip6tnl', 'sit')
+
+
+def run(cmd, stdin=None):
+    return subprocess.run(cmd, input=stdin, capture_output=True, text=True, check=False)
+
+
+def uci_get(config, section, option, default=None):
+    out = run(['uci', '-q', 'get', f'{config}.{section}.{option}'])
+    value = out.stdout.strip()
+    return value if out.returncode == 0 and value else default
+
+
+def table_exists(family, name):
+    return run(['nft', 'list', 'table', family, name]).returncode == 0
+
+
+def engine_state():
+    """Which inspection engines are in the packet path right now: (dpi, ips)."""
+    dpi = run(['nft', 'list', 'chain', 'inet', 'netifyd', 'nfq_forward']).returncode == 0
+    ips = table_exists('inet', 'snort')
+    return dpi, ips
+
+
+def ips_depth():
+    value = uci_get('snort', 'nfq', 'max_inspect_bytes', str(DEFAULT_IPS_DEPTH))
+    try:
+        return int(value)
+    except ValueError:
+        return DEFAULT_IPS_DEPTH
+
+
+def min_bytes(ips_active, setting=None):
+    """
+    Bytes a connection has to move before it is handed to the fast path. "auto" is the IPS inspection depth while the
+    IPS runs (it stops looking at the connection there anyway) and a small floor otherwise.
+    """
+    if setting not in (None, '', 'auto'):
+        try:
+            return max(int(setting), MIN_BYTES)
+        except ValueError:
+            pass
+    return max(ips_depth(), MIN_BYTES) if ips_active else MIN_BYTES
+
+
+def lower_devices(device, sys_net=SYS_NET, depth=0):
+    """The physical devices below a bridge, VLAN or bond; the device itself when there is nothing below it."""
+    if depth > 4:
+        return [device]
+    base = os.path.join(sys_net, device)
+    below = []
+    brif = os.path.join(base, 'brif')
+    if os.path.isdir(brif):
+        below.extend(sorted(os.listdir(brif)))
+    try:
+        below.extend(sorted(e[len('lower_'):] for e in os.listdir(base) if e.startswith('lower_')))
+    except OSError:
+        return []
+    if not below:
+        return [device]
+    found = []
+    for item in below:
+        found.extend(lower_devices(item, sys_net, depth + 1))
+    return found
+
+
+def flow_devices(interfaces, sys_net=SYS_NET):
+    """
+    Devices of the flow table: the physical devices under every up interface that routes traffic. Tunnels are left out
+    (their traffic is encapsulated and never offloaded), as are interfaces without a device.
+    """
+    devices = set()
+    for item in interfaces:
+        if not item.get('up') or item.get('proto') in (None, 'none'):
+            continue
+        device = item.get('device') or item.get('l3_device')
+        if not device or device.startswith(TUNNEL_PREFIXES):
+            continue
+        for lower in lower_devices(device, sys_net):
+            if os.path.isdir(os.path.join(sys_net, lower)) and not lower.startswith(TUNNEL_PREFIXES):
+                devices.add(lower)
+    return sorted(devices)
+
+
+def network_interfaces():
+    out = run(['ubus', 'call', 'network.interface', 'dump'])
+    try:
+        return json.loads(out.stdout).get('interface', [])
+    except ValueError:
+        return []
+
+
+def render(devices, threshold, dpi_active):
+    """The nftables ruleset."""
+    lines = [
+        f'table inet {TABLE} {{ }}',
+        f'delete table inet {TABLE}',
+        '',
+        f'table inet {TABLE} {{',
+        '    flowtable ft {',
+        '        hook ingress priority 0;',
+        f'        devices = {{ {", ".join(devices)} }};',
+        # keeps the byte and packet counters of the connection tracker current for offloaded connections: the
+        # traffic accounting and the engines' statistics read them
+        '        counter',
+        '    }',
+        '',
+        '    chain candidate {',
+    ]
+    if dpi_active:
+        lines.append('        ct label "netify-blocked" return')
+        for label in QOS_LABELS:
+            lines.append(f'        ct label "{label}" return')
+    lines += [
+        f'        meta l4proto {{ tcp, udp }} ct packets > {DPI_PACKETS} ct bytes > {threshold} flow add @ft',
+        '    }',
+        '',
+        '    chain forward {',
+        # after the engines' hooks (filter and filter + 10): only what they let through reaches this chain
+        '        type filter hook forward priority filter + 20; policy accept;',
+        '        ct state != established return',
+    ]
+    if dpi_active:
+        lines.append('        ct label "netify-analyzed" jump candidate')
+    else:
+        lines.append('        jump candidate')
+    lines += ['    }', '}', '']
+    return '\n'.join(lines)
+
+
+def syslog(message):
+    try:
+        subprocess.run(['logger', '-t', 'nexwall-fastpath', message], check=False, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def write_state(state):
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f)
+    except OSError:
+        pass
+
+
+def offloaded_flows(path=CONNTRACK_FILE):
+    try:
+        with open(path) as f:
+            return sum(1 for line in f if '[OFFLOAD]' in line)
+    except OSError:
+        return 0
+
+
+def flows(path=CONNTRACK_FILE):
+    """Connections on the fast path: [(proto, src, dst, sport, dport, bytes)]."""
+    out = []
+    try:
+        with open(path) as f:
+            for line in f:
+                if '[OFFLOAD]' not in line:
+                    continue
+                kv = {}
+                total = 0
+                for part in line.split():
+                    if '=' in part:
+                        k, v = part.split('=', 1)
+                        if k == 'bytes':
+                            total += int(v) if v.isdigit() else 0
+                        else:
+                            kv.setdefault(k, v)
+                out.append((line.split()[2], kv.get('src', ''), kv.get('dst', ''), kv.get('sport', ''), kv.get('dport', ''), total))
+    except OSError:
+        pass
+    return out
+
+
+def stop(reason='disabled'):
+    if table_exists('inet', TABLE):
+        run(['nft', 'delete', 'table', 'inet', TABLE])
+        syslog('fast path stopped (%s)' % reason)
+    write_state({'enabled': reason != 'disabled', 'active': False, 'reason': reason})
+
+
+def apply():
+    if uci_get('nexwall_perf', 'main', 'fastpath', '0') != '1':
+        stop('disabled')
+        return 0
+
+    dpi, ips = engine_state()
+    devices = flow_devices(network_interfaces())
+    if not devices:
+        stop('no-devices')
+        return 1
+    threshold = min_bytes(ips, uci_get('nexwall_perf', 'main', 'min_bytes', 'auto'))
+
+    # the byte counters of the connection tracker are what the rules above read
+    try:
+        with open('/proc/sys/net/netfilter/nf_conntrack_acct', 'w') as f:
+            f.write('1')
+    except OSError:
+        pass
+
+    result = run(['nft', '-f', '-'], stdin=render(devices, threshold, dpi))
+    if result.returncode != 0:
+        stop('error')
+        write_state({'enabled': True, 'active': False, 'reason': 'error', 'error': result.stderr.strip()[:300]})
+        print(result.stderr.strip(), file=sys.stderr)
+        syslog('fast path could not be applied: %s' % result.stderr.strip()[:200])
+        return 1
+    syslog('fast path active: devices %s, from %d bytes, dpi %s, ips %s' % (','.join(devices), threshold, dpi, ips))
+    write_state({'enabled': True, 'active': True, 'devices': devices, 'min_bytes': threshold, 'dpi': dpi, 'ips': ips})
+    return 0
+
+
+def status():
+    try:
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {'enabled': uci_get('nexwall_perf', 'main', 'fastpath', '0') == '1', 'active': False,
+                 'reason': 'not-applied'}
+    # the table is the truth, the state file only explains
+    state['active'] = table_exists('inet', TABLE)
+    state['offloaded_flows'] = offloaded_flows() if state['active'] else 0
+    print(json.dumps(state))
+    return 0
+
+
+if __name__ == '__main__':
+    cmd = sys.argv[1] if len(sys.argv) > 1 else 'status'
+    if cmd == 'apply':
+        sys.exit(apply())
+    if cmd == 'stop':
+        stop()
+        sys.exit(0)
+    if cmd == 'status':
+        sys.exit(status())
+    if cmd == 'list':
+        for proto, src, dst, sport, dport, total in sorted(flows(), key=lambda x: -x[5]):
+            print('%-4s %s:%s -> %s:%s  %d bytes' % (proto, src, sport, dst, dport, total))
+        sys.exit(0)
+    print('usage: nexwall-fastpath apply | status | stop | list', file=sys.stderr)
+    sys.exit(2)

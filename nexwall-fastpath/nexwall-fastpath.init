@@ -1,0 +1,29 @@
+#!/bin/sh /etc/rc.common
+
+#
+# Copyright (C) 2026 Nexwall
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Applies the fast path (see /usr/sbin/nexwall-fastpath) at boot and whenever something it depends on changes.
+
+START=99
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	/usr/sbin/nexwall-fastpath apply
+}
+
+stop_service() {
+	/usr/sbin/nexwall-fastpath stop
+}
+
+reload_service() {
+	/usr/sbin/nexwall-fastpath apply
+}
+
+service_triggers() {
+	procd_add_reload_trigger nexwall_perf dpi snort network
+	# an interface going up or down (a failover, a new link) may change where connections are routed
+	procd_add_raw_trigger "interface.*" 1000 /etc/init.d/nexwall-fastpath reload
+}
