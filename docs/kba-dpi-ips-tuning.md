@@ -154,3 +154,25 @@ uci commit; reload_config
 | Larger network card buffers | On | virtual NICs drop bursts with the small default buffers |
 
 Existing units keep what they have; the defaults are created only when the `nexwall_perf` settings do not exist yet.
+
+## Connection table and memory
+
+Every tracked connection costs about 5.6 KB (kernel, DPI and IPS together, measured with 77,000 connections), so the
+connection limit is derived from the installed memory: 32 entries per MiB, at least 65,536 (2 GiB: 65,536, 4 GiB: 131,072,
+8 GiB: 253,952, 16 GiB: 524,288). `nexwall-fastpath apply` sets it at boot and on reload (`nexwall_perf.main.conntrack_auto=0`
+keeps a manual `net.netfilter.nf_conntrack_max`). The kernel's own default (about 1,000,000 entries on 8 GiB) would let the
+engines use more memory than a small firewall has: the lab firewall stopped answering when the table grew far beyond what
+its 2 GiB could hold. Watch **Tracked connections** in the Engine monitor; if it stays near 100 % the limit is too low for
+the number of users and more memory is the answer, not a bigger table.
+
+IPS queues and threads follow the number of CPU cores (up to 16) automatically (`snort.nfq.cpu_auto=0` keeps a manual value);
+each extra thread adds about 15 MB of memory.
+
+## Engine monitor
+
+The Settings tab of Application Control (DPI) and Network Protection (IPS) starts with a live **Engine monitor** (refresh every
+5 seconds): CPU of the engine (percent of the whole system and of one core) and of the whole system, memory of the engine and of
+the system, **dropped packets** (packets the engine did not inspect because its queue was full or it did not answer; they
+are let through, fail open) as a ten-minute total, the worst percentage of traffic and a per-minute chart, packets waiting in
+the queues, and the tracked connections against the limit. A steady zero in dropped packets is the goal. Values come from
+`ubus call ns.dpi get-engine-metrics` (same for `ns.snort`).

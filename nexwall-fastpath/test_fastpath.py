@@ -161,16 +161,16 @@ def test_conntrack_target(mod, mem_mib, expected):
     assert mod.conntrack_target(mem_mib * 1024) == expected
 
 
-def test_conntrack_only_grows(mod, tmp_path, monkeypatch):
+def test_conntrack_is_set_to_the_target(mod, tmp_path, monkeypatch):
     monkeypatch.setattr(mod, 'syslog', lambda m: None)
     mem = tmp_path / 'meminfo'; mem.write_text('MemTotal:        8388608 kB\nMemFree: 1 kB\n')
     cmax = tmp_path / 'max'; cmax.write_text('65536\n')
     assert mod.tune_conntrack(str(mem), str(cmax)) == 262144
     assert cmax.read_text() == '262144'
     assert mod.tune_conntrack(str(mem), str(cmax)) is None            # nothing more to do
-    cmax.write_text('600000\n')
-    assert mod.tune_conntrack(str(mem), str(cmax)) is None            # never lowered
-    assert cmax.read_text() == '600000\n'
+    cmax.write_text('1015808\n')
+    assert mod.tune_conntrack(str(mem), str(cmax)) == 262144          # the kernel default for this memory is too high for the engines
+    assert cmax.read_text() == '262144'
     assert mod.tune_conntrack(str(tmp_path / 'none'), str(cmax)) is None
 
 
