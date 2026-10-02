@@ -172,3 +172,36 @@ def test_conntrack_only_grows(mod, tmp_path, monkeypatch):
     assert mod.tune_conntrack(str(mem), str(cmax)) is None            # never lowered
     assert cmax.read_text() == '600000\n'
     assert mod.tune_conntrack(str(tmp_path / 'none'), str(cmax)) is None
+
+
+def test_snort_cpus_follow_the_hardware(mod, monkeypatch):
+    calls, values = [], {'snort.nfq.queue_count': '4', 'snort.nfq.thread_count': '4'}
+
+    class R:
+        def __init__(self, rc=0, out=''):
+            self.returncode, self.stdout = rc, out
+
+    def fake_run(cmd, stdin=None):
+        calls.append(cmd)
+        if cmd[:3] == ['uci', '-q', 'get']:
+            return R(0 if cmd[3] in ('snort.nfq', *values) else 1, values.get(cmd[3], ''))
+        return R()
+
+    monkeypatch.setattr(mod, 'run', fake_run)
+    monkeypatch.setattr(mod, 'syslog', lambda m: None)
+    monkeypatch.setattr(mod, 'uci_get', lambda c, s, o, d=None: values.get('%s.%s.%s' % (c, s, o), d))
+    assert mod.tune_snort_cpus(16) == 16
+    assert ['uci', 'set', 'snort.nfq.thread_count=16'] in calls and ['uci', 'commit', 'snort'] in calls
+    calls.clear()
+    assert mod.tune_snort_cpus(64) == 16                    # never above 16
+    values['snort.nfq.queue_count'] = values['snort.nfq.thread_count'] = '16'
+    calls.clear()
+    assert mod.tune_snort_cpus(16) is None and not any(c[1] == 'set' for c in calls)
+    values['snort.nfq.cpu_auto'] = '0'
+    assert mod.tune_snort_cpus(2) is None                   # manual value kept
+
+
+def test_cpu_count(mod, tmp_path):
+    f = tmp_path / 'cpuinfo'; f.write_text('processor\t: 0\nmodel name: x\nprocessor\t: 1\n')
+    assert mod.cpu_count(str(f)) == 2
+    assert mod.cpu_count(str(tmp_path / 'none')) == 1

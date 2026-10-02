@@ -28,6 +28,9 @@
 # is deliberately low: 2 GiB keeps the kernel default, 8 GiB gives 262,144. Only ever grows it. The hash table is left alone
 # (resizing it on a loaded table is not worth the risk).
 #
+# Also (setting snort.nfq.cpu_auto, default on): keeps the IPS queues and threads equal to the CPU count (up to 16), so a firewall
+# moved to bigger hardware uses its cores without a save in the web interface; a change restarts the IPS once.
+#
 # Usage: nexwall-fastpath apply | status | stop | list
 #   list: the connections that are on the fast path right now (also: grep OFFLOAD /proc/net/nf_conntrack, conntrack -L | grep OFFLOAD)
 # Every apply, stop and failure is written to the system log with the tag nexwall-fastpath (grep nexwall-fastpath /var/log/messages).
@@ -261,6 +264,28 @@ def tune_conntrack(meminfo=MEMINFO, max_path=CT_MAX):
     return None
 
 
+def cpu_count(cpuinfo='/proc/cpuinfo'):
+    try:
+        with open(cpuinfo) as f:
+            return max(1, sum(1 for line in f if line.startswith('processor')))
+    except OSError:
+        return 1
+
+
+def tune_snort_cpus(cpus=None):
+    """Set snort.nfq queue_count and thread_count to the CPU count (max 16). Returns the count when it changed."""
+    if uci_get('snort', 'nfq', 'cpu_auto', '1') == '0' or run(['uci', '-q', 'get', 'snort.nfq']).returncode != 0:
+        return None
+    cpus = min(16, cpus or cpu_count())
+    if uci_get('snort', 'nfq', 'queue_count') == str(cpus) and uci_get('snort', 'nfq', 'thread_count') == str(cpus):
+        return None
+    run(['uci', 'set', 'snort.nfq.queue_count=%d' % cpus])
+    run(['uci', 'set', 'snort.nfq.thread_count=%d' % cpus])
+    run(['uci', 'commit', 'snort'])
+    syslog('IPS queues and threads set to the CPU count: %d' % cpus)
+    return cpus
+
+
 def write_state(state):
     try:
         with open(STATE_FILE, 'w') as f:
@@ -313,6 +338,7 @@ def apply():
         tune_rings(devices)
     if uci_get('nexwall_perf', 'main', 'conntrack_auto', '1') != '0':
         tune_conntrack()
+    tune_snort_cpus()
     if uci_get('nexwall_perf', 'main', 'fastpath', '0') != '1':
         stop('disabled')
         return 0
