@@ -154,3 +154,21 @@ def test_rings_are_raised_only_where_lower(mod, monkeypatch):
     assert list(changed) == ['eth2']
     assert ['ethtool', '-G', 'eth2', 'rx', '4096', 'tx', '4096'] in calls
     assert not any(c[:3] == ['ethtool', '-G', 'eth0'] for c in calls)
+
+
+@pytest.mark.parametrize('mem_mib,expected', [(256, 65536), (2048, 65536), (4096, 131072), (8192, 262144), (16384, 524288), (64000, 1048576)])
+def test_conntrack_target(mod, mem_mib, expected):
+    assert mod.conntrack_target(mem_mib * 1024) == expected
+
+
+def test_conntrack_only_grows(mod, tmp_path, monkeypatch):
+    monkeypatch.setattr(mod, 'syslog', lambda m: None)
+    mem = tmp_path / 'meminfo'; mem.write_text('MemTotal:        8388608 kB\nMemFree: 1 kB\n')
+    cmax = tmp_path / 'max'; cmax.write_text('65536\n')
+    assert mod.tune_conntrack(str(mem), str(cmax)) == 262144
+    assert cmax.read_text() == '262144'
+    assert mod.tune_conntrack(str(mem), str(cmax)) is None            # nothing more to do
+    cmax.write_text('600000\n')
+    assert mod.tune_conntrack(str(mem), str(cmax)) is None            # never lowered
+    assert cmax.read_text() == '600000\n'
+    assert mod.tune_conntrack(str(tmp_path / 'none'), str(cmax)) is None

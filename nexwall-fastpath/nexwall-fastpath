@@ -23,6 +23,11 @@
 # interfaces to their hardware maximum. Virtual network cards (e1000 and similar) ship with 256 descriptors and drop packets
 # in bursts; on the lab this took UDP loss at 300 Mbit/s from 53% to 0.3% and stopped TCP retransmit storms.
 #
+# Also (setting conntrack_auto, default on): sizes the connection tracking table from the installed memory (32 entries per
+# MiB, between 65,536 and 1,048,576). Every tracked connection also costs memory in the DPI and IPS engines, so the figure
+# is deliberately low: 2 GiB keeps the kernel default, 8 GiB gives 262,144. Only ever grows it. The hash table is left alone
+# (resizing it on a loaded table is not worth the risk).
+#
 # Usage: nexwall-fastpath apply | status | stop | list
 #   list: the connections that are on the fast path right now (also: grep OFFLOAD /proc/net/nf_conntrack, conntrack -L | grep OFFLOAD)
 # Every apply, stop and failure is written to the system log with the tag nexwall-fastpath (grep nexwall-fastpath /var/log/messages).
@@ -213,6 +218,49 @@ def tune_rings(devices):
     return changed
 
 
+CT_MAX = '/proc/sys/net/netfilter/nf_conntrack_max'
+MEMINFO = '/proc/meminfo'
+
+
+def conntrack_target(mem_kib):
+    """Entries wanted for this amount of memory: 32 per MiB, at least 65,536, at most 1,048,576."""
+    return max(65536, min(1048576, (mem_kib // 1024) * 32))
+
+
+def _read_int(path):
+    try:
+        with open(path) as f:
+            return int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def _write(path, value):
+    try:
+        with open(path, 'w') as f:
+            f.write(str(value))
+        return True
+    except OSError:
+        return False
+
+
+def tune_conntrack(meminfo=MEMINFO, max_path=CT_MAX):
+    """Raise the connection table limit to the size for this memory. Returns the new limit when it changed."""
+    mem_kib = 0
+    try:
+        with open(meminfo) as f:
+            for line in f:
+                if line.startswith('MemTotal:'):
+                    mem_kib = int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+    want = conntrack_target(mem_kib)
+    if _read_int(max_path) < want and _write(max_path, want):
+        syslog('connection table limit raised for %d MiB of memory: %d entries' % (mem_kib // 1024, want))
+        return want
+    return None
+
+
 def write_state(state):
     try:
         with open(STATE_FILE, 'w') as f:
@@ -263,6 +311,8 @@ def apply():
     devices = flow_devices(network_interfaces())
     if uci_get('nexwall_perf', 'main', 'ring_buffers', '0') == '1':
         tune_rings(devices)
+    if uci_get('nexwall_perf', 'main', 'conntrack_auto', '1') != '0':
+        tune_conntrack()
     if uci_get('nexwall_perf', 'main', 'fastpath', '0') != '1':
         stop('disabled')
         return 0
@@ -302,6 +352,7 @@ def status():
     # the table is the truth, the state file only explains
     state['active'] = table_exists('inet', TABLE)
     state['offloaded_flows'] = offloaded_flows() if state['active'] else 0
+    state['conntrack'] = {'count': _read_int('/proc/sys/net/netfilter/nf_conntrack_count'), 'max': _read_int(CT_MAX)}
     print(json.dumps(state))
     return 0
 
