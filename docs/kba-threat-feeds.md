@@ -59,6 +59,11 @@ DNS lists cost about **75 bytes per domain** in dnsmasq (measured: 1.8 million d
 The default set is about 870,000 domains (65 MB). Firewalls with 2 GiB should stay near it; 4 GiB or more can take adult, advertising and the extended malware list.
 Reloading dnsmasq with a large list interrupts DNS for a few seconds (about 10 seconds with 1.8 million domains); that is why reloads happen only when the lists change (usually once a day).
 
+## Geo-blocking and the memory warning
+
+Country blocks (banIP `country` feed) come from the same signed bundle: `nexwall-threat-feeds status` lists `country_v4` and `country_v6`, and the files are under `/mnt/data/threat-feeds/<bundle>/geo/`. The data is registry allocation data, so a few addresses may sit in another country than their users. Without a license banIP keeps its own download.
+In the DNS blocklist page, a warning appears when the switched-on lists need more than a fifth of the installed memory, and an error above a third; switch off large categories or add memory.
+
 ## Troubleshooting
 
 **No lists / "not licensed".** `nexwall-threat-feeds status` shows `license: unlicensed` or `last check: not licensed`. Register the firewall or ask for a trial; check `licensectl state`.
