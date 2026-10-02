@@ -65,8 +65,8 @@ if Snort rejects it, the previous rules stay. See *IPS > Settings > Signatures* 
 ## Shared: fast path and packet steering
 
 **Fast path.** Forwards the rest of long transfers through the kernel flow table after the engines are done with them
-(details, commands and troubleshooting: `kba-fast-path-offload.md`). Off by default; turn it on when long downloads,
-backups or video load the CPU.
+(details, commands and troubleshooting: `kba-fast-path-offload.md`). On by default on new installations (it only touches connections the engines are finished with); turn it off if you need
+every packet of long connections to be inspected or a rule change to reach existing connections at once.
 
 **Spread network processing across CPU cores (packet steering).** Lets all cores process network packets instead of mostly
 one. It helps firewalls with several cores and network cards with a **single receive queue** (virtual NICs, many small
@@ -105,7 +105,7 @@ Many small connections (3,000 short HTTP requests, 60 in parallel): about 155 re
 |---|---|---|---|---|---|
 | 1-2 cores | Automatic (1) | Connectivity | On | On (2 cores) | On |
 | 4 cores | Automatic (2) | Balanced | Optional (about +10% on long transfers in the lab) | On (a single-queue or virtual NIC loses most of its speed without it) | On |
-| 8+ cores | Automatic (4) | Balanced or Security | Optional | Usually not needed on multi-queue NICs | On for virtual NICs |
+| 8+ cores | Automatic (4) | Balanced or Security | On | Usually not needed on multi-queue NICs | On for virtual NICs |
 
 The lab numbers above are from a virtual firewall; a benchmark on the target hardware is still to be done. Change one setting at a time and compare.
 
@@ -141,3 +141,16 @@ uci commit; reload_config
 `uci show dpi.engine; uci show nexwall_perf; uci show snort | grep -v oinkcode`, `nexwall-fastpath status`,
 `nexwall-ips-rules status`, `dpidbg status`, `cat /proc/net/netfilter/nfnetlink_queue`, the number of CPU cores
 (`grep -c ^processor /proc/cpuinfo`), and the time and symptom (slow, dropped, blocked wrongly).
+
+## Defaults on a new installation
+
+| Setting | Default | Why |
+|---|---|---|
+| DPI inspection threads | Automatic | half of the cores, leaves the rest to the IPS and forwarding |
+| IPS protection level | Balanced | measured at full speed with the engines on; Connectivity only if the box is very small |
+| IPS behavior | Block | |
+| Fast path | On | after inspection only; about +10% throughput and -10% CPU in the lab |
+| Packet steering | On when there is more than one core | single-queue or virtual NICs went from 100 to about 700 Mbit/s |
+| Larger network card buffers | On | virtual NICs drop bursts with the small default buffers |
+
+Existing units keep what they have; the defaults are created only when the `nexwall_perf` settings do not exist yet.

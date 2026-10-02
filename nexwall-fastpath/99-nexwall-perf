@@ -1,10 +1,12 @@
 #!/bin/sh
-# performance settings shared by the DPI and IPS pages; the fast path is off until the administrator turns it on
+# performance settings shared by the DPI and IPS pages. Defaults chosen from the lab measurements (see nexwall-internal
+# msp/PERFORMANCE_AND_INSPECTION.md): fast path on (connections are handed over only after DPI and IPS are done with them),
+# larger NIC buffers on, packet steering on for more than one core. Each can be turned off in the Performance card.
 if ! uci -q get nexwall_perf.main >/dev/null; then
 	touch /etc/config/nexwall_perf
 	uci -q batch <<EOI
 set nexwall_perf.main=main
-set nexwall_perf.main.fastpath='0'
+set nexwall_perf.main.fastpath='1'
 set nexwall_perf.main.min_bytes='auto'
 set nexwall_perf.main.ring_buffers='1'
 commit nexwall_perf

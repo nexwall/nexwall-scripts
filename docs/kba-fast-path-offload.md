@@ -1,7 +1,7 @@
 # KBA: Fast path (flow offload): commands, status and troubleshooting
 
 **Product:** Nexwall Firewall  ·  **Component:** `nexwall-fastpath`, kernel flow table, DPI (`netifyd`) and IPS (`snort`)  ·
-**Severity:** informational (performance feature, off by default)
+**Severity:** informational (performance feature, on by default on new installations)
 
 ## What it is
 
