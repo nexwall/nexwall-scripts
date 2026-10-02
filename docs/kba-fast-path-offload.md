@@ -34,6 +34,8 @@ uci commit nexwall_perf
 /etc/init.d/nexwall-fastpath reload       # applies it now (also happens on the next config reload)
 ```
 
+Related setting handled by the same tool: `nexwall_perf.main.ring_buffers` (`1` raises the NIC rings to their maximum at apply time, independent of the fast path; see `kba-dpi-ips-tuning.md`).
+
 Optional: `uci set nexwall_perf.main.min_bytes=2097152` raises the threshold (default `auto`; values below 262144 are raised to it).
 
 ## Commands
@@ -96,8 +98,10 @@ it. A short web page never reaches the fast path.
   statistics and accounting keep working. (Without it the counters would freeze at the offload point.)
 - Tunnels (OpenVPN, WireGuard, IPsec) are not put in the flow table; their traffic is not accelerated.
 - SQM / traffic shaping on the interface still applies (it works at the queue discipline, after forwarding).
-- Measured on the lab (virtual NICs, about 20 Mbit/s client): works as designed, no speed difference visible. Benchmark on the
-  target hardware before promising numbers.
+- Measured on the lab (virtual firewall, iperf3 through it, 4 streams): about 10% more throughput and about 10% less CPU per Gbit/s
+  with the fast path (two A/B pairs, inside the noise of a shared host); see `kba-dpi-ips-tuning.md` for the full table. The
+  larger gains came from packet steering and bigger NIC buffers, not from the fast path. Benchmark on the target hardware
+  before promising numbers.
 
 ## Quick checks when something looks wrong
 

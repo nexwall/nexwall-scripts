@@ -56,6 +56,7 @@ nexwall-scripts/
 ├── dpidbg/
 ├── fwtrace/
 ├── nexwall-fastpath/
+├── perf-bench/
 └── nfq-watchdog/
 ```
 

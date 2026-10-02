@@ -110,3 +110,47 @@ def test_flow_listing(mod, tmp_path):
                  'ipv4 2 udp 17 30 src=10.0.0.3 dst=8.8.8.8 sport=1 dport=53 packets=1 bytes=60 src=8.8.8.8 dst=1.1.1.2 sport=53 dport=1 packets=1 bytes=90 mark=0\n')
     assert mod.flows(str(f)) == [('tcp', '10.0.0.2', '1.1.1.1', '40000', '443', 10000)]
     assert mod.flows(str(tmp_path / 'none')) == []
+
+
+ETHTOOL = """Ring parameters for eth2:
+Pre-set maximums:
+RX:\t\t4096
+RX Mini:\t0
+RX Jumbo:\t0
+TX:\t\t4096
+Current hardware settings:
+RX:\t\t256
+RX Mini:\t0
+RX Jumbo:\t0
+TX:\t\t256
+"""
+
+
+def test_ring_parsing(mod):
+    assert mod.parse_rings(ETHTOOL) == ({'rx': 4096, 'tx': 4096}, {'rx': 256, 'tx': 256})
+    assert mod.parse_rings('Cannot get device ring settings: Operation not supported') == ({}, {})
+
+
+def test_rings_are_raised_only_where_lower(mod, monkeypatch):
+    calls = []
+
+    class R:
+        def __init__(self, out='', rc=0):
+            self.stdout, self.returncode = out, rc
+
+    def fake_run(cmd, stdin=None):
+        calls.append(cmd)
+        if cmd[:2] == ['ethtool', '-g']:
+            if cmd[2] == 'eth0':
+                return R(ETHTOOL.replace('RX:\t\t256', 'RX:\t\t4096').replace('TX:\t\t256', 'TX:\t\t4096'))
+            if cmd[2] == 'eth9':
+                return R('', 1)
+            return R(ETHTOOL)
+        return R()
+
+    monkeypatch.setattr(mod, 'run', fake_run)
+    monkeypatch.setattr(mod, 'syslog', lambda m: None)
+    changed = mod.tune_rings(['eth0', 'eth2', 'eth9'])
+    assert list(changed) == ['eth2']
+    assert ['ethtool', '-G', 'eth2', 'rx', '4096', 'tx', '4096'] in calls
+    assert not any(c[:3] == ['ethtool', '-G', 'eth0'] for c in calls)

@@ -15,6 +15,7 @@ Every UI setting is saved as a pending change: press **Apply changes** afterward
 | DPI queue limit | same card | `dpi.engine.queue_limit` (`128`, `256`, `512`, `1024`) |
 | Fast path | DPI > Settings > Performance and IPS > Settings > Performance (same switch) | `nexwall_perf.main.fastpath` (`0`, `1`) |
 | Spread network processing across CPU cores | same two cards (same switch) | `network.@globals[0].packet_steering` (`0`, `1`) |
+| Larger network card buffers | same two cards (same switch) | `nexwall_perf.main.ring_buffers` (`0`, `1`) |
 | IPS on/off, protection level | Network Protection (IPS) > Settings | `snort.snort.enabled`, `snort.snort.ns_policy` (`connectivity`, `balanced`, `security`) |
 | Behavior on a match | IPS > Settings | `snort.snort.action` (`default` = Block, `alert` = Detect only) |
 | Also log detections that are not blocked | IPS > Settings | `snort.snort.ns_alert_excluded` (`0`, `1`) |
@@ -72,16 +73,41 @@ one. It helps firewalls with several cores and network cards with a **single rec
 boards); multi-queue server NICs already spread the load. No effect on a single-core device. Check the effect with
 `cat /sys/class/net/<wan>/queues/rx-0/rps_cpus` (a mask with more than one bit) and `top` (load on several cores).
 
+**Larger network card buffers (`ring_buffers`).** Raises the receive and transmit rings of the physical interfaces to the
+hardware maximum (`ethtool -G <if> rx max tx max`, applied at boot, on interface changes and when the setting changes).
+Virtual network cards (e1000 on VMware, VirtualBox and similar) start with 256 descriptors and drop packets in bursts: slow
+TCP with thousands of retransmissions, UDP loss. Check with `ethtool -g <if>` (current vs maximum). Safe on physical
+hardware. On by default for new installations.
+
+## Measured on the lab (virtual firewall, 4 vCPU, e1000, 2026-10-02)
+
+Client VM through the firewall to a server VM, iperf3, 4 TCP streams, reverse direction, 3 x 10 s per line (Mbit/s, mean):
+
+| Configuration | Result |
+|---|---|
+| Direct between the two VMs (no firewall) | about 2,700 |
+| Firewall, no DPI/IPS, default NIC rings, no steering | 17 to 120, thousands of retransmissions |
+| same, rings at maximum | 100, one retransmission |
+| rings at maximum + packet steering | 694 |
+| + DPI and IPS on (balanced) | 736 |
+| + fast path | 740 to 890 (two A/B pairs: fast path 866 and 920 Mbit/s at 60 and 52 CPU % per Gbit/s, off 840 and 758 at 60 and 65) |
+
+Reading: on this virtual NIC the first limit was the ring size (UDP at 300 Mbit/s lost 53% with 256 descriptors, 0.3% with 4096),
+the second the single interrupt that kept one core at 100% (steering moved the load: 100 to about 700 Mbit/s). With those two
+fixed, DPI and IPS cost little for large transfers, because they only inspect the first 32 packets / 1 MiB of each connection,
+and the fast path gave about 10% more throughput for about 10% less CPU per Gbit/s (inside the noise of a shared host).
+Many small connections (3,000 short HTTP requests, 60 in parallel): about 155 requests/s with DPI and IPS on against 163 to 184 without
+(the test server was the limit). Absolute numbers depend on the hypervisor; use them for comparing settings, not as product specs.
+
 ## Starting points by hardware (not benchmarked yet)
 
-| Hardware | DPI threads | IPS level | Fast path | Packet steering |
-|---|---|---|---|---|
-| 1-2 cores | Automatic (1) | Connectivity | On | On (2 cores) |
-| 4 cores | Automatic (2) | Balanced | On if long transfers dominate | On if the NIC has one queue |
-| 8+ cores | Automatic (4) | Balanced or Security | Optional | Usually not needed |
+| Hardware | DPI threads | IPS level | Fast path | Packet steering | Larger buffers |
+|---|---|---|---|---|---|
+| 1-2 cores | Automatic (1) | Connectivity | On | On (2 cores) | On |
+| 4 cores | Automatic (2) | Balanced | Optional (about +10% on long transfers in the lab) | On (a single-queue or virtual NIC loses most of its speed without it) | On |
+| 8+ cores | Automatic (4) | Balanced or Security | Optional | Usually not needed on multi-queue NICs | On for virtual NICs |
 
-These are starting points, not measured results: a benchmark on the target hardware (Mbit/s per CPU %, with the IPS on) is
-still to be done. Change one setting at a time and compare.
+The lab numbers above are from a virtual firewall; a benchmark on the target hardware is still to be done. Change one setting at a time and compare.
 
 ## How to check the effect
 
@@ -104,6 +130,7 @@ uci -q delete dpi.engine.threads
 uci set dpi.engine.overload_action=allow; uci set dpi.engine.queue_limit=256
 uci set nexwall_perf.main.fastpath=0
 uci set network.@globals[0].packet_steering=0
+uci set nexwall_perf.main.ring_buffers=0
 uci set snort.snort.action=default; uci set snort.snort.ns_alert_excluded=0
 uci set snort.nfq.max_inspect_bytes=1048576
 uci commit; reload_config
