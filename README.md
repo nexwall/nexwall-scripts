@@ -51,6 +51,7 @@ nexwall-scripts/
 │   ├── kba-unknown-applications.md
 │   ├── kba-fast-path-offload.md
 │   ├── kba-dpi-ips-tuning.md
+│   ├── kba-threat-feeds.md
 │   └── watchdog-logs-and-coredumps.md
 ├── drppkt/
 ├── dpidbg/
@@ -66,6 +67,7 @@ nexwall-scripts/
 - [`docs/kba-unknown-applications.md`](docs/kba-unknown-applications.md): traffic shows as Unknown or an application is not blocked.
 - [`docs/kba-fast-path-offload.md`](docs/kba-fast-path-offload.md): the fast path (flow offload): commands, status, where offloaded traffic shows, troubleshooting.
 - [`docs/kba-dpi-ips-tuning.md`](docs/kba-dpi-ips-tuning.md): the tuning controls in the DPI and IPS Settings tabs, what they do, how to check the effect.
+- [`docs/kba-threat-feeds.md`](docs/kba-threat-feeds.md): Threat Shield lists (DNS and IP): where they come from, commands, memory, troubleshooting.
 - [`docs/watchdog-logs-and-coredumps.md`](docs/watchdog-logs-and-coredumps.md): where the queue watchdog logs, reports and core dumps are, and how to enable core dumps.
 
 Future scripts should follow the same pattern: one directory per tool,
