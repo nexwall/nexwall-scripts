@@ -72,7 +72,7 @@ conntrack -L 2>/dev/null | grep OFFLOAD
 - **System log:** every apply, stop and failure is logged with the tag `nexwall-fastpath`:
 
 ```sh
-logread -e nexwall-fastpath
+grep nexwall-fastpath /var/log/messages
 ```
 
 ## Reading `status`
@@ -109,7 +109,7 @@ it. A short web page never reaches the fast path.
 nexwall-fastpath status
 nft list table inet nexwall_fastpath | head -30
 grep -c OFFLOAD /proc/net/nf_conntrack
-logread -e nexwall-fastpath | tail
+grep nexwall-fastpath /var/log/messages | tail
 /etc/init.d/nexwall-fastpath status
 ```
 
@@ -122,6 +122,6 @@ uci set nexwall_perf.main.fastpath=0; uci commit nexwall_perf; nexwall-fastpath 
 ## What to collect before contacting support
 
 1. `nexwall-fastpath status`, `nexwall-fastpath list | head`, `nft list table inet nexwall_fastpath`.
-2. `logread -e nexwall-fastpath`.
+2. `grep nexwall-fastpath /var/log/messages`.
 3. `uci show nexwall_perf; uci show dpi.engine; uci show snort.nfq`.
 4. The affected client and server addresses and the time, so the connection can be found in `nexwall-fastpath list`.

@@ -25,7 +25,7 @@
 #
 # Usage: nexwall-fastpath apply | status | stop | list
 #   list: the connections that are on the fast path right now (also: grep OFFLOAD /proc/net/nf_conntrack, conntrack -L | grep OFFLOAD)
-# Every apply, stop and failure is written to the system log with the tag nexwall-fastpath (logread -e nexwall-fastpath).
+# Every apply, stop and failure is written to the system log with the tag nexwall-fastpath (grep nexwall-fastpath /var/log/messages).
 # Settings (/etc/config/nexwall_perf, section main): fastpath 0|1, min_bytes auto|<bytes>, ring_buffers 0|1
 
 import json
