@@ -23,8 +23,11 @@ service (trial or subscription), signed, and checked on the firewall before use.
    something changed, not on a timer.
 4. If the licence service is not answering, the lists on the firewall stay. If the licence ends, the lists are taken away once.
 
-First start: the categories marked as default (malware, phishing, ransomware, scams, botnet C2, known attackers) are switched on, but only where
-nothing was chosen yet. Choices made with earlier versions are carried over (adult, gambling, piracy, DoH/VPN bypass, malware, privacy lists).
+First start: **all** categories are switched on (every address list and every domain category), but only where nothing was chosen yet and only when
+the domain lists take at most a quarter of the installed memory (75 bytes per domain; the whole catalog is about 3.3 million domains, 250 MB, so a unit
+with about 1 GiB or more qualifies). A smaller unit gets only the categories marked as default (malware, phishing, ransomware, scams, botnet C2, known
+attackers). The setup wizard also switches the services on. The DNS Filtering and IP & Geo Blocking pages have an **Enable all** switch that drives the
+Nexwall lists (the third-party lists of banIP are not touched). Choices made with earlier versions are carried over (adult, gambling, piracy, DoH/VPN bypass, malware, privacy lists).
 
 ## Commands
 
@@ -56,7 +59,8 @@ DNS lists cost about **75 bytes per domain** in dnsmasq (measured: 1.8 million d
 | Adult | 953,000 | 71 MB |
 | Malware (extended, includes the core one) | 735,000 | 55 MB |
 
-The default set is about 870,000 domains (65 MB). Firewalls with 2 GiB should stay near it; 4 GiB or more can take adult, advertising and the extended malware list.
+The default set is about 870,000 domains (65 MB). Everything together is about 3.3 million domains (250 MB), 12% of a 2 GiB unit: the memory
+warning of the DNS page (20% / 35% of the installed memory) tells when the switched-on lists are too many.
 Reloading dnsmasq with a large list interrupts DNS for a few seconds (about 10 seconds with 1.8 million domains); that is why reloads happen only when the lists change (usually once a day).
 
 ## Geo-blocking and the memory warning
